@@ -1,64 +1,106 @@
+import time
+import math
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from rclpy.clock import Clock
-#from geometry_msgs.msg import Twist
 from geometry_msgs.msg import TwistStamped
-from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import Odometry
 
-class ObstacleStop(Node):
+class SquareOdom(Node):
     def __init__(self):
-        super().__init__('obstacle_stop_node')
-        # 1. Definimos el perfil de QoS compatible con el LiDAR del TB3
+        super().__init__('square_odom_node')
         qos_profile_b = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, depth=10)
-        qos_profile_r = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, depth=10)
+
+
         # Publicador para mover el robot
-        self.publisher = self.create_publisher(TwistStamped, '/cmd_vel', qos_profile_r)
-        # Subscriptor al LiDAR
-        self.subscription = self.create_subscription(LaserScan, '/scan', self.scan_callback, qos_profile_b)
+        self.subscription = self.create_subscription(Odometry, '/odom', self.odom_callback, qos_profile_b)
+
+        self.x = None
+        self.y = None
+        self.yaw = None
         
-        self.safe_distance = 0.25  # 25 cm
         self.linear_speed = 0.15    # m/s
-        #move_msg = TwistStamped()
-        #move_msg.linear.x = self.linear_speed
-        #self.publisher.publish(move_msg)
+        self.angular_speed = 0.3    # rad/s
+        self.side_length = 1.0      # 1 meter
 
-    def scan_callback(self, msg):
-        # El LiDAR del TB3 tiene 360 puntos. El índice 0 es el frente.
-        # Comprobamos un rango pequeño al frente (de -15 a 15 grados)
-        front_ranges = msg.ranges[0:15] + msg.ranges[345:359]
-        
-        # Filtramos valores infinitos o erróneos (0.0)
-        valid_ranges = [r for r in front_ranges if r > msg.range_min]
-        
-        min_distance = min(valid_ranges) if valid_ranges else float('inf')
+    def odom_callback(self, msg):
+        self.x = msg.pose.pose.position.x
+        self.y = msg.pose.pose.position.y
+        q = msg.pose.pose.orientation
+        self.yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
 
+
+    def publish_velocity(self, linear, angular):  
         move_msg = TwistStamped()
         move_msg.header.stamp = Clock().now().to_msg()
         move_msg.header.frame_id = ''
-        move_msg.twist.linear.x = 0.0
-        move_msg.twist.linear.y = 0.0
-        move_msg.twist.linear.z = 0.0
-        move_msg.twist.angular.x = 0.0
-        move_msg.twist.angular.y = 0.0
-        move_msg.twist.angular.z = 0.0
-
-        if min_distance > self.safe_distance:
-            move_msg.twist.linear.x = self.linear_speed
-            self.get_logger().info(f'Camino despejado. Distancia: {min_distance:.2f}m')
-        else:
-            move_msg.twist.linear.x = 0.0
-            self.get_logger().warn(f'¡OBSTÁCULO DETECTADO! Parando a {min_distance:.2f}m')
-
+        move_msg.twist.linear.x = linear
+        move_msg.twist.angular.z = angular
         self.publisher.publish(move_msg)
-       
+
+    def wait(self, seconds):
+        start = time.time()
+        while time.time() - start < seconds:
+            rclpy.spin_once(self, timeout_sec=0.05)
+
+    def stop(self):
+        self.publish_velocity(0.0, 0.0)
+        self.wait(0.5)
+
+    @staticmethod
+    def normalize_angle(angle):
+        # Deja el ángulo entre -pi y pi (evita el salto de 180 a -180)
+        return math.atan2(math.sin(angle), math.cos(angle))
+
+
+    def move_forward(self, distance):
+        x0, y0 = self.x, self.y
+        travelled = 0.0
+        while travelled < distance:
+            self.publish_velocity(self.linear_speed, 0.0)
+            rclpy.spin_once(self, timeout_sec=0.05)
+            travelled = math.hypot(self.x - x0, self.y - y0)
+        self.stop()
+        self.get_logger().info(f'Recorrido: {travelled:.3f} m')
+
+    def turn(self, angle):
+        direction = self.angular_speed if angle > 0 else -self.angular_speed
+        previous_yaw = self.yaw
+        turned = 0.0
+        while abs(turned) < abs(angle):
+            self.publish_velocity(0.0, direction)
+            rclpy.spin_once(self, timeout_sec=0.05)
+            turned += self.normalize_angle(self.yaw - previous_yaw)
+            previous_yaw = self.yaw
+        self.stop()
+        self.get_logger().info(f'Girado: {math.degrees(turned):.1f} grados')
+
+    def run_square(self):
+
+        while self.x is None:
+            self.wait(0.1)
+        start_x, start_y, start_yaw = self.x, self.y, self.yaw
+
+        for side in range(4):
+            self.get_logger().info(f'Lado {side + 1}')
+            self.move_forward(self.side_length)
+            self.turn(math.pi/2)  # Girar 90 grados
+        self.get_logger().info('Cuadrado completado')
+
+
+        error_pos = math.hypot(self.x - start_x, self.y - start_y)
+        error_yaw = math.degrees(self.normalize_angle(self.yaw - start_yaw))
+        self.get_logger().info(f'Error posición: {error_pos:.3f} m, error orientación: {error_yaw:.1f} grados')
+
+
 
 def main(args=None):
-    print('Hi from package_go_stop.')
+    print('Hi from package_square_odom.')
     rclpy.init(args=args)
-    node = ObstacleStop()
+    node = SquareOdom()
     try:
-        rclpy.spin(node)
+        node.run_square()
     except KeyboardInterrupt:
         pass
     finally:
