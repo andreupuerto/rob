@@ -1,64 +1,66 @@
+import time
+import math
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from rclpy.clock import Clock
-#from geometry_msgs.msg import Twist
 from geometry_msgs.msg import TwistStamped
-from sensor_msgs.msg import LaserScan
 
-class ObstacleStop(Node):
+class SquareTimed(Node):
     def __init__(self):
-        super().__init__('obstacle_stop_node')
-        # 1. Definimos el perfil de QoS compatible con el LiDAR del TB3
-        qos_profile_b = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, depth=10)
+        super().__init__('square_timed_node')
         qos_profile_r = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, depth=10)
+
         # Publicador para mover el robot
         self.publisher = self.create_publisher(TwistStamped, '/cmd_vel', qos_profile_r)
-        # Subscriptor al LiDAR
-        self.subscription = self.create_subscription(LaserScan, '/scan', self.scan_callback, qos_profile_b)
         
         self.safe_distance = 0.25  # 25 cm
         self.linear_speed = 0.15    # m/s
-        #move_msg = TwistStamped()
-        #move_msg.linear.x = self.linear_speed
-        #self.publisher.publish(move_msg)
+        self.angular_speed = 0.3    # rad/s
+        self.side_length = 1.0      # 1 meter
 
-    def scan_callback(self, msg):
-        # El LiDAR del TB3 tiene 360 puntos. El índice 0 es el frente.
-        # Comprobamos un rango pequeño al frente (de -15 a 15 grados)
-        front_ranges = msg.ranges[0:15] + msg.ranges[345:359]
+    def publish_velocity(self, linear, angular):
         
-        # Filtramos valores infinitos o erróneos (0.0)
-        valid_ranges = [r for r in front_ranges if r > msg.range_min]
-        
-        min_distance = min(valid_ranges) if valid_ranges else float('inf')
-
         move_msg = TwistStamped()
         move_msg.header.stamp = Clock().now().to_msg()
         move_msg.header.frame_id = ''
-        move_msg.twist.linear.x = 0.0
-        move_msg.twist.linear.y = 0.0
-        move_msg.twist.linear.z = 0.0
-        move_msg.twist.angular.x = 0.0
-        move_msg.twist.angular.y = 0.0
-        move_msg.twist.angular.z = 0.0
-
-        if min_distance > self.safe_distance:
-            move_msg.twist.linear.x = self.linear_speed
-            self.get_logger().info(f'Camino despejado. Distancia: {min_distance:.2f}m')
-        else:
-            move_msg.twist.linear.x = 0.0
-            self.get_logger().warn(f'¡OBSTÁCULO DETECTADO! Parando a {min_distance:.2f}m')
-
+        move_msg.twist.linear.x = linear
+        move_msg.twist.angular.z = angular
         self.publisher.publish(move_msg)
-       
+
+    def stop(self):
+        self.publish_velocity(0.0, 0.0)
+
+    def move_during(self, linear, angular, duration):
+        start = time.time()
+        while time.time() - start < duration:
+            self.publish_velocity(linear, angular)
+            time.sleep(0.05)
+        self.stop()
+
+    def move_forward(self, distance):
+        duration = distance / self.linear_speed
+        self.move_during(self.linear_speed, 0.0, duration)
+
+    def turn(self, angle):
+        duration = abs(angle) / self.angular_speed
+        angular_direction = self.angular_speed if angle > 0 else -self.angular_speed
+        self.move_during(0.0, angular_direction, duration)
+
+    def run_square(self):
+        for side in range(4):
+            self.get_logger().info(f'Lado {side + 1}')
+            self.move_forward(self.side_length)
+            self.turn(math.pi/2)  # Girar 90 grados
+        self.get_logger().info('Cuadrado completado')
+
 
 def main(args=None):
-    print('Hi from package_go_stop.')
+    print('Hi from package_square_timed.')
     rclpy.init(args=args)
-    node = ObstacleStop()
+    node = SquareTimed()
     try:
-        rclpy.spin(node)
+        node.run_square()
     except KeyboardInterrupt:
         pass
     finally:
