@@ -1,71 +1,59 @@
+import math
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
-from rclpy.clock import Clock
-#from geometry_msgs.msg import Twist
-from geometry_msgs.msg import TwistStamped
 from sensor_msgs.msg import LaserScan
 
-class ObstacleStop(Node):
+class LidarScan(Node):
     def __init__(self):
-        super().__init__('obstacle_stop_node')
-        # 1. Definimos el perfil de QoS compatible con el LiDAR del TB3
+        super().__init__('lidar_scan_node')
+        # Perfil de QoS compatible con el LiDAR del TB3
         qos_profile_b = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, depth=10)
-        qos_profile_r = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, depth=10)
-        # Publicador para mover el robot
-        self.publisher = self.create_publisher(TwistStamped, '/cmd_vel', qos_profile_r)
         # Subscriptor al LiDAR
         self.subscription = self.create_subscription(LaserScan, '/scan', self.scan_callback, qos_profile_b)
-        
-        self.safe_distance = 0.25  # 25 cm
-        self.linear_speed = 0.15    # m/s
-        #move_msg = TwistStamped()
-        #move_msg.linear.x = self.linear_speed
-        #self.publisher.publish(move_msg)
+
+        self.num_readings = 10     # N lecturas
+        self.readings = []         # una lista de distancias por lectura
+        self.done = False
 
     def scan_callback(self, msg):
-        # El LiDAR del TB3 tiene 360 puntos. El índice 0 es el frente.
-        # Comprobamos un rango pequeño al frente (de -15 a 15 grados)
-        front_ranges = msg.ranges[0:15] + msg.ranges[345:359]
-        
-        # Filtramos valores infinitos o erróneos (0.0)
-        valid_ranges = [r for r in front_ranges if r > msg.range_min]
-        
-        min_distance = min(valid_ranges) if valid_ranges else float('inf')
+        if self.done:
+            return
+        self.readings.append(list(msg.ranges))
+        self.angle_min = msg.angle_min
+        self.angle_increment = msg.angle_increment
+        self.range_min = msg.range_min
+        self.range_max = msg.range_max
+        self.get_logger().info(f'Lectura {len(self.readings)}/{self.num_readings}')
+        if len(self.readings) == self.num_readings:
+            self.analyze()
+            self.done = True
 
-        move_msg = TwistStamped()
-        move_msg.header.stamp = Clock().now().to_msg()
-        move_msg.header.frame_id = ''
-        move_msg.twist.linear.x = 0.0
-        move_msg.twist.linear.y = 0.0
-        move_msg.twist.linear.z = 0.0
-        move_msg.twist.angular.x = 0.0
-        move_msg.twist.angular.y = 0.0
-        move_msg.twist.angular.z = 0.0
-
-        if min_distance > self.safe_distance:
-            move_msg.twist.linear.x = self.linear_speed
-            self.get_logger().info(f'Camino despejado. Distancia: {min_distance:.2f}m')
-        else:
-            move_msg.twist.linear.x = 0.0
-            self.get_logger().warn(f'¡OBSTÁCULO DETECTADO! Parando a {min_distance:.2f}m')
-
-        self.publisher.publish(move_msg)
-       
+    def analyze(self):
+        print(f'{"Ángulo":>7} | {"Mín":>6} | {"Máx":>6} | {"Media":>6} | Válidas')
+        for i in range(len(self.readings[0])):
+            angle = math.degrees(self.angle_min + i * self.angle_increment)
+            values = [reading[i] for reading in self.readings]
+            valid = [r for r in values
+                     if math.isfinite(r) and self.range_min <= r <= self.range_max]
+            if valid:
+                print(f'{angle:7.1f} | {min(valid):6.3f} | {max(valid):6.3f} | '
+                      f'{sum(valid) / len(valid):6.3f} | {len(valid)}/{len(values)}')
+            else:
+                print(f'{angle:7.1f} | {"-":>6} | {"-":>6} | {"-":>6} | 0/{len(values)}')
 
 def main(args=None):
-    print('Hi from package_go_stop.')
+    print('Hi from package_lidar_scan.')
     rclpy.init(args=args)
-    node = ObstacleStop()
+    node = LidarScan()
     try:
-        rclpy.spin(node)
+        while rclpy.ok() and not node.done:
+            rclpy.spin_once(node)
     except KeyboardInterrupt:
         pass
     finally:
-        # Siempre es bueno mandar un último mensaje de parada
-        node.publisher.publish(TwistStamped())
         node.destroy_node()
-        rclpy.shutdown()
+        rclpy.try_shutdown()
 
 if __name__ == '__main__':
     main()
