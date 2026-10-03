@@ -1,72 +1,135 @@
-import time
 import math
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
-from rclpy.clock import Clock
 from geometry_msgs.msg import TwistStamped
+from nav_msgs.msg import Odometry
 
-class SquareTimed(Node):
+
+class SquareOdom(Node):
     def __init__(self):
-        super().__init__('square_timed_node')
-        qos_profile_r = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, depth=10)
+        super().__init__('square_odom_node')
+        qos_r = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, depth=10)
+        qos_b = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, depth=10)
 
-        # Publicador para mover el robot
-        self.publisher = self.create_publisher(TwistStamped, '/cmd_vel', qos_profile_r)
-        
-        self.linear_speed = 0.15    # m/s
-        self.angular_speed = 0.3    # rad/s
-        self.side_length = 1.0      # 1 meter
+        self.publisher = self.create_publisher(TwistStamped, '/cmd_vel', qos_r)
+        self.subscription = self.create_subscription(
+            Odometry, '/odom', self.odom_callback, qos_b)
 
-    def publish_velocity(self, linear, angular):  
-        move_msg = TwistStamped()
-        move_msg.header.stamp = Clock().now().to_msg()
-        move_msg.header.frame_id = ''
-        move_msg.twist.linear.x = linear
-        move_msg.twist.angular.z = angular
-        self.publisher.publish(move_msg)
+        self.x = None
+        self.y = None
+        self.yaw = None
+
+        self.side_length = 1.0        # m
+
+        # --- Velocidades lineales ---
+        self.fast_linear = 0.20       # m/s  (zona lejos del objetivo)
+        self.slow_linear = 0.05       # m/s  (zona cerca del objetivo)
+        self.slow_distance = 0.20     # m    (a partir de aquí se ralentiza)
+
+        # --- Velocidades angulares ---
+        self.fast_angular = 0.8       # rad/s
+        self.slow_angular = 0.15      # rad/s
+        self.slow_angle = 0.35        # rad (~20°) (a partir de aquí se ralentiza)
+
+        # --- Tolerancias ---
+        self.dist_tol = 0.005         # m
+        self.yaw_tol = 0.015          # rad (~0.9°)
+
+    def odom_callback(self, msg):
+        self.x = msg.pose.pose.position.x
+        self.y = msg.pose.pose.position.y
+        q = msg.pose.pose.orientation
+        self.yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                              1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+    def publish_velocity(self, linear, angular):
+        msg = TwistStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = ''
+        msg.twist.linear.x = linear
+        msg.twist.angular.z = angular
+        self.publisher.publish(msg)
+
+    def wait(self, seconds):
+        end = self.get_clock().now().nanoseconds + int(seconds * 1e9)
+        while self.get_clock().now().nanoseconds < end:
+            rclpy.spin_once(self, timeout_sec=0.05)
 
     def stop(self):
         self.publish_velocity(0.0, 0.0)
-        time.sleep(0.5)
+        self.wait(0.5)
 
-    def move_during(self, linear, angular, duration):
-        start = time.time()
-        while time.time() - start < duration:
-            self.publish_velocity(linear, angular)
-            time.sleep(0.05)
-        self.stop()
+    @staticmethod
+    def normalize_angle(angle):
+        return math.atan2(math.sin(angle), math.cos(angle))
 
     def move_forward(self, distance):
-        duration = distance / self.linear_speed
-        self.move_during(self.linear_speed, 0.0, duration)
+        x0, y0 = self.x, self.y
+        travelled = 0.0
+        while rclpy.ok():
+            remaining = distance - travelled
+            if remaining <= self.dist_tol:
+                break
+            # Dos velocidades: rápida lejos, lenta cerca
+            if remaining > self.slow_distance:
+                v = self.fast_linear
+            else:
+                v = self.slow_linear
+            self.publish_velocity(v, 0.0)
+            rclpy.spin_once(self, timeout_sec=0.05)
+            travelled = math.hypot(self.x - x0, self.y - y0)
+        self.stop()
+        self.get_logger().info(f'Recorrido: {travelled:.3f} m')
 
-    def turn(self, angle):
-        duration = abs(angle) / self.angular_speed
-        angular_direction = self.angular_speed if angle > 0 else -self.angular_speed
-        self.move_during(0.0, angular_direction, duration)
+    def turn_to(self, target_yaw):
+        while rclpy.ok():
+            error = self.normalize_angle(target_yaw - self.yaw)
+            if abs(error) <= self.yaw_tol:
+                break
+            # Dos velocidades: rápida lejos, lenta cerca
+            if abs(error) > self.slow_angle:
+                w = self.fast_angular
+            else:
+                w = self.slow_angular
+            self.publish_velocity(0.0, math.copysign(w, error))
+            rclpy.spin_once(self, timeout_sec=0.05)
+        self.stop()
+        self.get_logger().info(
+            f'Yaw actual: {math.degrees(self.yaw):.1f} grados')
 
     def run_square(self):
+        while rclpy.ok() and self.x is None:
+            rclpy.spin_once(self, timeout_sec=0.1)
+        start_x, start_y, start_yaw = self.x, self.y, self.yaw
+
         for side in range(4):
             self.get_logger().info(f'Lado {side + 1}')
             self.move_forward(self.side_length)
-            self.turn(math.pi/2)  # Girar 90 grados
+            target = self.normalize_angle(start_yaw + (side + 1) * math.pi / 2)
+            self.turn_to(target)
         self.get_logger().info('Cuadrado completado')
+
+        error_pos = math.hypot(self.x - start_x, self.y - start_y)
+        error_yaw = math.degrees(self.normalize_angle(self.yaw - start_yaw))
+        self.get_logger().info(
+            f'Error posición: {error_pos:.3f} m, error orientación: {error_yaw:.1f} grados')
 
 
 def main(args=None):
-    print('Hi from package_square_timed.')
+    print('Hi from package_square_odom.')
     rclpy.init(args=args)
-    node = SquareTimed()
+    node = SquareOdom()
     try:
         node.run_square()
     except KeyboardInterrupt:
         pass
     finally:
-        # Siempre es bueno mandar un último mensaje de parada
         node.publisher.publish(TwistStamped())
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
