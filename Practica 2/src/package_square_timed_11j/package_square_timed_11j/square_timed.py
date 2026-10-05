@@ -15,7 +15,7 @@ class SquareTimed(Node):
         self.publisher = self.create_publisher(TwistStamped, '/cmd_vel', qos_profile_r)
         
         self.linear_speed = 0.15    # m/s
-        self.angular_speed = 0.3    # rad/s
+        self.angular_speed = 0.5    # rad/s
         self.side_length = 1.0      # 1 meter
 
     def publish_velocity(self, linear, angular):  
@@ -34,7 +34,7 @@ class SquareTimed(Node):
         start = time.time()
         while time.time() - start < duration:
             self.publish_velocity(linear, angular)
-            time.sleep(0.05)
+            time.sleep(0.1)
         self.stop()
 
     def move_forward(self, distance):
