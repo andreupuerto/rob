@@ -20,7 +20,7 @@ class Bug2(Node):
             LaserScan, '/scan', self.scan_callback, qos_b)
 
         # --- Parámetros (los pasa el launch) ---
-        # El objetivo está en el frame odom, relativo a la pose inicial del robot
+        # El objetivo es relativo a la pose inicial del robot: x hacia delante, y hacia la izquierda
         self.declare_parameter('goal_x', 2.7)
         self.declare_parameter('goal_y', 0.0)
         self.declare_parameter('advanced', False)
@@ -28,8 +28,11 @@ class Bug2(Node):
         # --- Puntos ---
         self.start_x = None           # primera posición de /odom (define la m-line)
         self.start_y = None
-        self.goal_x = self.get_parameter('goal_x').value
-        self.goal_y = self.get_parameter('goal_y').value
+        self.start_yaw = None
+        self.goal_dx = self.get_parameter('goal_x').value     # objetivo relativo al inicio
+        self.goal_dy = self.get_parameter('goal_y').value
+        self.goal_x = None            # objetivo en el frame odom (se calcula con la 1ª odometría)
+        self.goal_y = None
 
         # --- Velocidades ---
         self.linear_speed = 0.2       # m/s  (yendo hacia el objetivo)
@@ -64,6 +67,8 @@ class Bug2(Node):
         self.goal_free = 0.0          # hacia el objetivo (±45°)
 
         # --- Estado de Bug2 ---
+        self.last_linear = 0.0        # último comando enviado (para el log)
+        self.last_angular = 0.0
         self.goal_distance = None
         self.hit_distance = None      # None: voy al objetivo. Con valor: rodeando una pared
         self.hit_x = None             # dónde choqué
@@ -72,14 +77,20 @@ class Bug2(Node):
         self.unreachable = False
 
     def odom_callback(self, msg):
-        self.x = msg.pose.pose.position.x
-        self.y = msg.pose.pose.position.y
-        if self.start_x is None:
-            self.start_x = self.x
-            self.start_y = self.y
         q = msg.pose.pose.orientation
         self.yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
                               1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        self.x = msg.pose.pose.position.x
+        self.y = msg.pose.pose.position.y
+        if self.start_x is None:
+            # Primera odometría: fija el inicio y pasa el objetivo al frame odom
+            self.start_x = self.x
+            self.start_y = self.y
+            self.start_yaw = self.yaw
+            self.goal_x = self.start_x + self.goal_dx * math.cos(self.start_yaw) \
+                - self.goal_dy * math.sin(self.start_yaw)
+            self.goal_y = self.start_y + self.goal_dx * math.sin(self.start_yaw) \
+                + self.goal_dy * math.cos(self.start_yaw)
 
     def scan_callback(self, msg):
         # El ángulo 0 del LiDAR es el frente y crece hacia la izquierda.
@@ -119,6 +130,8 @@ class Bug2(Node):
         msg.twist.linear.x = linear
         msg.twist.angular.z = angular
         self.publisher.publish(msg)
+        self.last_linear = linear
+        self.last_angular = angular
 
     def stop(self):
         self.publish_velocity(0.0, 0.0)
@@ -195,12 +208,32 @@ class Bug2(Node):
 
         modo = 'avanzado' if self.advanced_mode else 'básico'
         self.get_logger().info(
-            f'Inicio ({self.start_x:.2f}, {self.start_y:.2f}) -> '
-            f'objetivo ({self.goal_x:.2f}, {self.goal_y:.2f}). Modo {modo}')
+            f'Inicio ({self.start_x:.2f}, {self.start_y:.2f}, '
+            f'{math.degrees(self.start_yaw):.0f}°) -> '
+            f'objetivo odom ({self.goal_x:.2f}, {self.goal_y:.2f}) '
+            f'[relativo ({self.goal_dx:.2f}, {self.goal_dy:.2f})]. Modo {modo}')
+
+        # Diagnóstico: más de un publicador en estos topics significa que hay otra fuente
+        # (Gazebo a la vez, otro nodo moviendo el robot, otro grupo en el mismo dominio...)
+        for topic in ('/cmd_vel', '/odom', '/scan'):
+            # En /cmd_vel el nuestro ya cuenta como 1; en /odom y /scan solo debe publicar el robot
+            n_pub = self.count_publishers(topic)
+            if n_pub > 1:
+                self.get_logger().warn(
+                    f'{topic} tiene {n_pub} publicadores (esperado 1). '
+                    f'Revisa con: ros2 topic info {topic} -v')
 
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.05)
             self.goal_distance = math.hypot(self.goal_x - self.x, self.goal_y - self.y)
+
+            estado = 'LINEA' if self.hit_distance is None else 'PARED'
+            self.get_logger().info(
+                f'[{estado}] pos=({self.x:.2f}, {self.y:.2f}) '
+                f'yaw={math.degrees(self.yaw):.0f}° dist_obj={self.goal_distance:.2f} '
+                f'front={self.front:.2f} right={self.right:.2f} libre_obj={self.goal_free:.2f} '
+                f'cmd=({self.last_linear:.2f}, {self.last_angular:.2f})',
+                throttle_duration_sec=1.0)
 
             if self.goal_distance < self.goal_tol:
                 self.stop()
