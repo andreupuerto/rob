@@ -19,9 +19,6 @@ def yaw_from_quaternion(q):
     return math.atan2(2.0 * (q.w * q.z + q.x * q.y),
                       1.0 - 2.0 * (q.y * q.y + q.z * q.z))
 
-def mix(x, y, a):
-    return x * (1 - a) + y * a
-
 def clamp(value, low, high):
     return max(low, min(high, value))
 
@@ -132,6 +129,10 @@ class autonavigation(Node):
         self.declare_parameter("pose_source", "slam") # odom | slam
         self.declare_parameter("log_file", "mission_log.csv")
         self.declare_parameter("map_file", "mapa_robot")
+        self.declare_parameter("start_delay", 5.0) # s de espera antes de moverse (para grabar)
+        # deteccion de pilares (ajustables en el robot real sin tocar el codigo)
+        self.declare_parameter("pillar_max_range", 2.5) # m
+        self.declare_parameter("min_sightings", 15) # veces que hay que ver un pilar
 
         # velocidades
         self.max_linear_speed = 0.25 # m/s
@@ -162,8 +163,10 @@ class autonavigation(Node):
         self.goal_y = None
 
         # distancias
-        self.detected_wall = False # si ha detectado un obstaculo o no
         self.safe_distance = 0.25
+        self.emergency_distance = 0.13 # m, algo tan cerca (en cualquier direccion): paro
+        self.wait_time = 3.0 # s, espero a ver si un obstaculo se aparta antes de rodearlo
+        self.wait_since = None
         self.wall_distance = 0.2
         self.goal_tolerance = 0.12
         self.yaw_tol = 0.08
@@ -172,6 +175,7 @@ class autonavigation(Node):
         # LiDAR
         self.front = None
         self.right = None
+        self.closest = None # lo mas cercano en cualquier direccion
         self.goal_free = float('inf') # distancia libre en direccion al objetivo
         self.lidar_offset = -0.032 # m, el LiDAR esta un poco detras del centro del robot
         self.scan_id = 0
@@ -194,9 +198,9 @@ class autonavigation(Node):
 
         # Pilares y estacion
         self.pillar_radius = 0.025
-        self.pillar_max_range = 2.5 # m, mas lejos el LiDAR casi no los ve
-        self.min_sightings = 15 # veces que hay que ver un pilar para fiarse (las esquinas
-                                # de pared que parecen pilares se ven pocas veces)
+        self.pillar_max_range = self.get_parameter("pillar_max_range").value # mas lejos casi no se ven
+        self.min_sightings = self.get_parameter("min_sightings").value # las esquinas de pared
+                                # que parecen pilares se ven pocas veces
         self.pillars = [] # pilares del ultimo scan, en el marco del robot
         self.landmarks = [] # pilares acumulados en mundo: [x, y, veces]
         self.last_scan_used = -1
@@ -225,6 +229,7 @@ class autonavigation(Node):
                                   'station_x', 'station_y'])
         self.last_log = -1.0
         self.log_period = 0.5 # s
+        self.map_saved = False
 
     def odom_callback(self, msg):
         self.odom_x = msg.pose.pose.position.x
@@ -234,6 +239,7 @@ class autonavigation(Node):
     def scan_callback(self, msg):
         front = float('inf')
         right = float('inf')
+        closest = float('inf')
         goal_free = float('inf')
 
         goal_direction = 0.0
@@ -244,6 +250,7 @@ class autonavigation(Node):
         for i, r in enumerate(msg.ranges):
             if math.isinf(r) or math.isnan(r) or r < msg.range_min:
                 continue
+            closest = min(closest, r)
             angle = math.degrees(
                 normalize_angle(msg.angle_min + i * msg.angle_increment))
             if -30 <= angle <= 30:
@@ -255,6 +262,7 @@ class autonavigation(Node):
 
         self.front = front
         self.right = right
+        self.closest = closest
         self.goal_free = goal_free
         self.pillars = self.detect_pillars(msg)
         self.scan_id += 1
@@ -422,6 +430,7 @@ class autonavigation(Node):
         self.following_wall = False
         self.left_hit = False
         self.unreachable = False
+        self.wait_since = None
 
     def follow_line(self):
         # Voy hacia el objetivo. Si hay un obstaculo delante, paso a rodearlo
@@ -433,6 +442,15 @@ class autonavigation(Node):
             angular = math.copysign(max(abs(angular), self.min_angular_speed), error)
             self.publish_velocity(0.0, angular)
         elif self.front < self.safe_distance and self.front < self.goal_distance:
+            # primero espero: si es algo que se mueve, se apartara y sigo sin rodear
+            now = self.get_clock().now().nanoseconds / 1e9
+            if self.wait_since is None:
+                self.wait_since = now
+                self.get_logger().info(f'Obstaculo a {self.front:.2f} m: espero')
+            if now - self.wait_since < self.wait_time:
+                self.publish_velocity(0.0, 0.0)
+                return
+            self.wait_since = None
             self.following_wall = True
             self.hit_distance = self.goal_distance
             self.hit_x = self.x
@@ -441,6 +459,7 @@ class autonavigation(Node):
             self.get_logger().info(f'Obstaculo a {self.front:.2f} m: rodeo la pared')
             self.stop()
         else:
+            self.wait_since = None
             linear = clamp(self.k_linear * self.goal_distance,
                            self.min_linear_speed, self.max_linear_speed)
             self.publish_velocity(linear, angular)
@@ -486,6 +505,12 @@ class autonavigation(Node):
         if self.unreachable:
             self.stop()
             return True
+        if self.closest < self.emergency_distance:
+            # algo muy cerca en cualquier direccion (tambien a los lados): no me muevo
+            self.publish_velocity(0.0, 0.0)
+            self.get_logger().warn(f'Algo a {self.closest:.2f} m: parado',
+                                   throttle_duration_sec=2.0)
+            return False
         if self.following_wall:
             self.follow_wall()
         else:
@@ -523,11 +548,28 @@ class autonavigation(Node):
             error = normalize_angle(target_yaw - self.yaw)
             if abs(error) <= self.yaw_tol:
                 break
+            if self.closest < self.emergency_distance: # girar rozaria con lo que hay al lado
+                self.publish_velocity(0.0, 0.0)
+                continue
             angular = clamp(self.k_angular * error, -self.max_angular_speed,
                             self.max_angular_speed)
             angular = math.copysign(max(abs(angular), 0.15), error)
             self.publish_velocity(0.0, angular)
         self.stop()
+
+    def countdown(self, seconds):
+        # Cuenta atras con el robot quieto, para dar tiempo a empezar a grabar
+        end = self.get_clock().now().nanoseconds / 1e9 + seconds
+        last = None
+        while rclpy.ok():
+            remaining = end - self.get_clock().now().nanoseconds / 1e9
+            if remaining <= 0.0:
+                break
+            if math.ceil(remaining) != last:
+                last = math.ceil(remaining)
+                self.get_logger().info(f'Empiezo en {last} s')
+            rclpy.spin_once(self, timeout_sec=0.05)
+            self.update_pose()
 
     def look_around(self, seconds):
         # Parado, solo mira: con el robot quieto las observaciones de los pilares son coherentes
@@ -553,6 +595,7 @@ class autonavigation(Node):
                 continue
             if result.returncode == 0:
                 self.get_logger().info('Mapa guardado')
+                self.map_saved = True
                 return True
             self.get_logger().warn(
                 f'map_saver_cli ha fallado (intento {attempt}/3): '
@@ -685,6 +728,7 @@ class autonavigation(Node):
         self.get_logger().info(
             f'Salida {self.start_point}: x={self.x:.2f} y={self.y:.2f} '
             f'yaw={math.degrees(self.yaw):.1f} grados ({self.pose_source})')
+        self.countdown(self.get_parameter("start_delay").value)
 
         # FASE I: navegacion global hasta la pose final (zona 2)
         self.phase = 'I'
@@ -700,6 +744,12 @@ class autonavigation(Node):
             return
         if self.station is None:
             self.get_logger().warn('Estacion sin confirmar: miro parado desde P_Base')
+            self.look_around(5.0)
+        if self.station is None:
+            # segunda pasada, en sentido contrario, para ver los pilares desde otro lado
+            self.get_logger().warn('Estacion sin confirmar: segunda pasada del pasillo')
+            if not self.go_path(list(reversed(self.explore_path)) + ['P_Base']):
+                return
             self.look_around(5.0)
         self.save_map()
         if self.station is None:
@@ -731,6 +781,12 @@ def main(args=None):
     finally:
         if rclpy.ok():
             node.publisher.publish(TwistStamped())
+        if not node.map_saved and node.x is not None:
+            # la mision se ha interrumpido: guardo igualmente el mapa que haya hasta ahora
+            try:
+                node.save_map()
+            except Exception as error: # noqa: el mapa es un extra, no debe tapar el cierre
+                print(f'No se ha podido guardar el mapa: {error}')
         node.close_log()
         node.destroy_node()
         if rclpy.ok():

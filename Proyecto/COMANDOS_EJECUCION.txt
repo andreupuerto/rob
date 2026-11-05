@@ -1,0 +1,253 @@
+=====================================================================
+ PROYECTO NAVEGACION AUTONOMA - GRUPO 11j
+ GUIA PASO A PASO PARA EJECUTARLO EN EL LABORATORIO
+=====================================================================
+
+RESUMEN DE QUE CORRE Y DONDE
+  - TurtleBot (por SSH) ........ SOLO el bringup (da /scan, /odom, /tf)
+  - PC, terminal 2 ............. SLAM (slam_toolbox)
+  - PC, terminal 3 ............. nuestro nodo (autonavigation)
+  - PC, terminal 4 (opcional) .. RViz2 para ver el mapa
+
+---------------------------------------------------------------------
+ 0. UNA SOLA VEZ: COMPILAR EL PAQUETE (en el PC del laboratorio)
+---------------------------------------------------------------------
+  Copiar la carpeta autonavigation_11j dentro de ~/ros2_ws/src/
+
+  cd ~/ros2_ws
+  colcon build --packages-select autonavigation_11j
+  source install/setup.bash
+
+  Cada terminal nueva necesita:  source ~/ros2_ws/install/setup.bash
+  (si cambias algo en autonavigation.py hay que repetir colcon build)
+
+  Comprobar que hay SLAM instalado en este PC:
+  ros2 pkg list | grep slam
+    -> debe salir "slam_toolbox". Si no sale, avisar: habria que usar
+       cartographer (lo instala el script del laboratorio) y ajustar frames.
+
+---------------------------------------------------------------------
+ 1. ANTES DE ARRANCAR
+---------------------------------------------------------------------
+  - Colocar el robot EXACTAMENTE en el punto de salida (marcar con cinta),
+    mirando hacia la direccion de start_yaw (ver nota de yaw abajo).
+  - PC y robot con el mismo ROS_DOMAIN_ID (como en el teleop):
+      echo $ROS_DOMAIN_ID
+
+---------------------------------------------------------------------
+ 2. TERMINAL 1 - EN EL TURTLEBOT (por SSH). SOLO ESTO:
+---------------------------------------------------------------------
+  ros2 launch turtlebot3_bringup robot.launch.py
+
+---------------------------------------------------------------------
+ 3. TERMINAL 2 - EN EL PC: SLAM
+---------------------------------------------------------------------
+  ros2 launch slam_toolbox online_async_launch.py
+
+  Lanzarlo con el robot YA colocado en el punto de salida: el mapa del SLAM
+  empieza donde esta el robot en ese momento.
+
+  Comprobar que funciona (en otra terminal del PC):
+    ros2 topic list | grep -E "scan|odom|map"
+    ros2 run tf2_ros tf2_echo map base_footprint
+      -> debe imprimir Translation y Rotation (si no, el SLAM no esta listo)
+
+---------------------------------------------------------------------
+ 4. TERMINAL 3 - EN EL PC: NUESTRO NODO
+---------------------------------------------------------------------
+  IMPORTANTE: ejecutarlo desde una carpeta donde se pueda escribir. Ahi se
+  crean mission_log.csv y mapa_robot.pgm/.yaml. Una carpeta por intento:
+
+    mkdir -p ~/resultados/intento1
+    cd ~/resultados/intento1
+
+  Ejecucion normal (mision completa, fases I, II y III):
+
+    ros2 run autonavigation_11j autonavigation --ros-args -p start_point:=A -p start_yaw:=0.0
+
+  Al arrancar hace una CUENTA ATRAS de 5 s ("Empiezo en 5 s ...") con el robot
+  quieto, para dar tiempo a empezar a grabar el video.
+
+  PARAMETROS (todos opcionales, se anaden con -p nombre:=valor):
+    start_point   punto de salida, por defecto A (A, B, C o D, zona 1)
+    start_yaw     orientacion inicial en radianes, por defecto 0.0
+    start_delay   segundos de cuenta atras, por defecto 5.0
+    path          puntos de la fase I (lista). Por defecto:
+                  ['B','C','D','E','F','G','Door_in','Door','Door_out','Via_Q','Q']
+                  Ejemplo: -p path:="['B','C']"
+    final_yaw     orientacion al acabar la fase I (rad), por defecto 3.14159
+    explore_path  puntos del barrido del pasillo, por defecto
+                  ['Cor_1','Cor_2','Cor_3','Cor_4']
+    pose_source   slam (por defecto) o odom
+    log_file      nombre del CSV, por defecto mission_log.csv
+    map_file      prefijo del mapa, por defecto mapa_robot
+    min_sightings veces que hay que ver un pilar para fiarse (def. 15)
+    pillar_max_range  distancia maxima a la que se buscan pilares (def. 2.5 m)
+
+  NO usar use_sim_time en el robot real (solo en simulacion).
+
+  PRUEBAS PARCIALES (muy recomendable antes de la mision completa):
+    Solo ir de A a B:
+      ros2 run autonavigation_11j autonavigation --ros-args -p start_point:=A -p path:="['B']"
+    Probar solo fases II y III (robot colocado en P_Base):
+      ros2 run autonavigation_11j autonavigation --ros-args -p start_point:=P_Base -p path:="['P_Base']"
+    Sin SLAM (solo odometria, para depurar):
+      ros2 run autonavigation_11j autonavigation --ros-args -p pose_source:=odom
+
+  MENSAJES QUE DEBERIAS VER
+    Salida A: x=0.70 y=0.92 yaw=0.0 grados (slam)   <- pose inicial correcta
+    Empiezo en 5 s ... 1 s
+    Voy a B (...)  /  Llegado a B: ... error=0.1xx m
+    Obstaculo a 0.2x m: espero      <- ve algo delante, espera 3 s
+    Obstaculo a 0.2x m: rodeo la pared   <- sigue ahi: lo rodea (Bug2)
+    Algo a 0.1x m: parado           <- algo muy cerca: parada de emergencia
+    Fase I completada
+    Estacion encontrada: centro=(x, y) lado=0.3x m
+    Guardando el mapa ... / Mapa guardado
+    Fase II completada
+    Acoplado: el centro de la estacion esta a 0.0xx m del robot
+    Mision completada
+  Si NO aparece "Estacion encontrada": bajar min_sightings (p. ej. 8) y/o
+  ajustar pillar_max_range. Si sigue sin encontrarla, termina con error pero
+  guarda el mapa igualmente.
+
+  PARAR EN CUALQUIER MOMENTO: Ctrl+C en esta terminal. Para el robot y guarda
+  el mapa que haya hasta ese momento.
+
+---------------------------------------------------------------------
+ 5. VER EL MAPA EN DIRECTO (RViz2) - opcional
+---------------------------------------------------------------------
+  ros2 launch turtlebot3_bringup rviz2.launch.py
+    -> Add -> By topic -> /map -> Map     (Fixed Frame: map)
+
+---------------------------------------------------------------------
+ 6. LOS ARCHIVOS QUE SE GENERAN
+---------------------------------------------------------------------
+  En la carpeta desde la que ejecutaste el nodo:
+    mapa_robot.pgm    imagen del mapa
+    mapa_robot.yaml   resolucion y origen del mapa
+    mission_log.csv   log de la mision (timestamp, fase, pose, obstaculo,
+                      pilares, posicion de la estacion)
+
+  OJO: cada ejecucion SOBRESCRIBE esos archivos si usas la misma carpeta.
+  Usa una carpeta por intento (intento1, intento2...) o cambia los nombres:
+    -p log_file:=intento2.csv -p map_file:=mapa2
+
+  Guardar el mapa a mano en cualquier momento (con el SLAM en marcha):
+    ros2 run nav2_map_server map_saver_cli -f ~/resultados/mapa_manual
+
+---------------------------------------------------------------------
+ 7. CONVERTIR EL MAPA .pgm A .png (para verlo y para el informe)
+---------------------------------------------------------------------
+  Un .pgm no se abre con las apps normales de Windows.
+
+  Opcion A (Python, en la carpeta del mapa):
+    python3 -c "from PIL import Image; Image.open('mapa_robot.pgm').save('mapa_robot.png')"
+    (si falta PIL:  sudo apt install python3-pil)
+
+  Opcion B (ImageMagick):
+    convert mapa_robot.pgm mapa_robot.png
+
+  Opcion C (ampliado x3 para verlo mejor):
+    python3 -c "from PIL import Image; im=Image.open('mapa_robot.pgm'); im.resize((im.width*3, im.height*3), Image.NEAREST).save('mapa_robot_x3.png')"
+
+  Ver la imagen:  eog mapa_robot.png     (o abrirla desde el explorador)
+
+  Nota: el mapa esta en el marco del ARRANQUE del robot (su origen es donde
+  estaba el robot al lanzar el SLAM), no en el marco del enunciado.
+
+---------------------------------------------------------------------
+ 8. DIAGRAMAS DE NODOS Y TOPICS (para el informe)
+---------------------------------------------------------------------
+  Con TODO en marcha (bringup, SLAM y nuestro nodo), en otra terminal:
+
+  Grafo automatico (hacer captura de pantalla):
+    ros2 run rqt_graph rqt_graph
+    (arriba a la izquierda: "Nodes/Topics (all)" y desmarcar "Hide ..." si
+     faltan cosas)
+
+  Listas de texto (copiar al informe):
+    ros2 node list
+    ros2 topic list -t
+    ros2 node info /autonavigation_node
+    ros2 node info /slam_toolbox
+
+  Arbol de TF (genera frames.pdf en la carpeta actual):
+    ros2 run tf2_tools view_frames
+
+  DIAGRAMA DE BLOQUES SIMPLE (el que pide el enunciado):
+
+    [TurtleBot: bringup]
+        |  /scan (LaserScan)   /odom (Odometry)   /tf
+        v
+    [slam_toolbox] ---- /map (OccupancyGrid), TF map->odom ---->
+        |                                                        |
+        |  TF map->base_footprint                                |
+        v                                                        v
+    [autonavigation_node] ---------- /map ----------> [map_saver_cli]
+        |  lee /scan                                    (nav2_map_server)
+        |  publica /cmd_vel (TwistStamped) -> TurtleBot  escribe .pgm/.yaml
+        |  escribe mission_log.csv
+
+  Topics usados:
+    /scan     sensor_msgs/LaserScan        TurtleBot -> slam, nodo
+    /odom     nav_msgs/Odometry            TurtleBot -> slam (el nodo la tiene
+                                           como respaldo con pose_source:=odom)
+    /tf       TF2                          odom->base_footprint (robot),
+                                           map->odom (slam)
+    /map      nav_msgs/OccupancyGrid       slam -> map_saver_cli
+    /cmd_vel  geometry_msgs/TwistStamped   nodo -> TurtleBot
+
+---------------------------------------------------------------------
+ 9. ENTREGABLES - COPIAR LO BUENO
+---------------------------------------------------------------------
+  Del intento que quedes (el del video):
+    mkdir -p ~/entrega
+    cp ~/resultados/intento1/mapa_robot.pgm  ~/entrega/
+    cp ~/resultados/intento1/mapa_robot.yaml ~/entrega/
+    cp ~/resultados/intento1/mission_log.csv ~/entrega/
+
+  Paquete (sin compilados):
+    cd ~/ros2_ws/src
+    zip -r ~/entrega/autonavigation_11j.zip autonavigation_11j -x "*/__pycache__/*"
+
+  Falta tambien: informe tecnico (con los diagramas), declaracion de uso de
+  IA y video de la mision completa.
+
+---------------------------------------------------------------------
+ 10. SI ALGO FALLA
+---------------------------------------------------------------------
+  El nodo se queda sin moverse tras "Salida ..." o no llega a salir:
+    -> no hay TF del SLAM: revisar paso 3 (tf2_echo map base_footprint).
+       Probar con -p pose_source:=odom para ver si es cosa del SLAM.
+  El robot gira hacia un lado equivocado al empezar:
+    -> start_yaw incorrecto (ver nota de yaw).
+  Se desvia / llega lejos de los puntos:
+    -> el robot no estaba bien colocado en el punto de salida, o el SLAM se
+       lanzo antes de colocarlo.
+  No ve /scan o /odom:
+    ros2 topic list ; ros2 topic hz /scan   (mismo ROS_DOMAIN_ID en robot y PC)
+  Cruza mal la puerta o el pasillo:
+    -> los puntos Door_in, Door_out, Via_Q, Cor_1..Cor_4 salen de un mundo
+       simulado: MEDIR la puerta y el pasillo reales y corregirlos en
+       autonavigation.py (diccionario self.points), luego colcon build.
+  Cambiaste el codigo y no hace caso:
+    -> falta colcon build (y source install/setup.bash).
+
+---------------------------------------------------------------------
+ NOTA SOBRE EL YAW (orientacion)
+---------------------------------------------------------------------
+  yaw = angulo del frente del robot respecto al eje +x del mundo, medido en
+  sentido antihorario (radianes: 0 = +x, 1.5708 = +y, 3.14159 = -x).
+  En el PNG del enunciado, filas = x (crece hacia abajo) y columnas = y
+  (crece hacia la derecha), segun el ajuste que hicimos; yaw 0 = mirando hacia
+  donde crece x. PREGUNTAR al profesor la orientacion inicial asignada.
+
+---------------------------------------------------------------------
+ SUPOSICIONES SIN CONFIRMAR (preguntar al profesor)
+---------------------------------------------------------------------
+  - Orientacion inicial (start_yaw) y pose final de la zona 2 (ahora: Q, yaw pi).
+  - Si se permite usar un SLAM ya hecho (slam_toolbox).
+  - Origen del mapa del enunciado (los PNG no lo traen).
+  - Si hay obstaculos dinamicos y como se mueven.
+=====================================================================
