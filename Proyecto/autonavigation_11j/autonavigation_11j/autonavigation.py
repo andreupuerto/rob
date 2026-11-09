@@ -139,6 +139,9 @@ class autonavigation(Node):
         self.turning = False
 
         self.phase = 'I'
+        self.detecting = False
+        self.docking = False
+        self.lidar_x = -0.032
         self.pillars = []
         self.scan_id = 0
         self.last_scan_id = 0
@@ -207,7 +210,7 @@ class autonavigation(Node):
         self.closest = near[2] if len(near) >= 3 else float('inf')
         self.goal_free = goal_free
 
-        if self.phase == 'II':
+        if self.detecting or self.docking:
             self.pillars = self.detect_pillars(msg)
         else:
             self.pillars = []
@@ -353,7 +356,7 @@ class autonavigation(Node):
         self.x = self.initial_x + dx * math.cos(a) - dy * math.sin(a)
         self.y = self.initial_y + dx * math.sin(a) + dy * math.cos(a)
         self.yaw = normalize_angle(yaw - self.yaw0 + self.initial_yaw)
-        if self.phase == 'II':
+        if self.detecting:
             self.update_landmarks()
         self.log_row()
         return True
@@ -607,22 +610,28 @@ class autonavigation(Node):
         self.get_logger().info(f'Guardando el mapa en {self.map_file}.yaml / .pgm')
         path = os.path.abspath(self.map_file)
         started = time.time()
-        command = ['ros2', 'service', 'call', '/slam_toolbox/save_map',
-                   'slam_toolbox/srv/SaveMap', "{name: {data: '" + path + "'}}"]
-        try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=30)
-        except (subprocess.TimeoutExpired, OSError) as error:
-            self.get_logger().error(f'No se ha podido guardar el mapa: {error}')
-            return
-        if result.returncode == 0 and os.path.exists(path + '.pgm') \
-                and os.path.getmtime(path + '.pgm') >= started - 1.0:
-            self.map_saved = True
-            self.get_logger().info('Mapa guardado')
-        else:
-            self.get_logger().error(f'No se ha podido guardar el mapa: {result.stderr[-200:]}')
+        commands = [
+            ['ros2', 'run', 'nav2_map_server', 'map_saver_cli', '-f', path],
+            ['ros2', 'service', 'call', '/slam_toolbox/save_map',
+             'slam_toolbox/srv/SaveMap', "{name: {data: '" + path + "'}}"]]
+        for attempt in range(3):
+            for command in commands:
+                try:
+                    result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+                except (subprocess.TimeoutExpired, OSError) as error:
+                    self.get_logger().warn(f'{command[1]} {command[2]} ha fallado: {error}')
+                    continue
+                if result.returncode == 0 and os.path.exists(path + '.pgm') \
+                        and os.path.getmtime(path + '.pgm') >= started - 1.0:
+                    self.map_saved = True
+                    self.get_logger().info('Mapa guardado')
+                    return
+                self.get_logger().warn(f'{command[1]} {command[2]} no ha guardado el mapa')
+            time.sleep(2.0)
+        self.get_logger().error('No se ha podido guardar el mapa')
 
 
-    def dock(self):
+    def station_geometry(self):
         cx, cy = self.station
         p0 = self.station_pillars[0]
         others = sorted(self.station_pillars[1:],
@@ -639,11 +648,50 @@ class autonavigation(Node):
             if diff < best_diff:
                 best_diff = diff
                 normal = candidate
+        return cx, cy, normal
 
+    def go_to_stage(self, cx, cy, normal):
         self.points["Stage"] = (cx + self.stage_distance * math.cos(normal),
                                 cy + self.stage_distance * math.sin(normal))
         if not self.go_path(["Stage"]):
             self.get_logger().warn('No he podido llegar al punto de aproximacion')
+            return False
+        return True
+
+    def live_centre(self):
+        near = [p for p in self.pillars if math.hypot(p[0], p[1]) < 1.0]
+        if len(near) != 4:
+            return None
+        dists = sorted(math.hypot(a[0] - b[0], a[1] - b[1])
+                       for i, a in enumerate(near) for b in near[i + 1:])
+        if min(dists[:4]) < 0.28 or max(dists[:4]) > 0.52 \
+                or min(dists[4:]) < 0.40 or max(dists[4:]) > 0.70:
+            return None
+        x = sum(p[0] for p in near) / 4 + self.lidar_x
+        y = sum(p[1] for p in near) / 4
+        return x, y
+
+    def refresh_station(self):
+        self.landmarks = []
+        self.detecting = True
+        normal_sightings = self.min_sightings
+        self.min_sightings = 5
+        end = time.monotonic() + 2.0
+        while rclpy.ok() and time.monotonic() < end:
+            self.spin(0.05)
+            self.update_pose()
+        self.min_sightings = normal_sightings
+        self.detecting = False
+        self.get_logger().info(f'Estacion revisada: centro=({self.station[0]:.2f}, '
+                               f'{self.station[1]:.2f})')
+
+    def dock(self):
+        cx, cy, normal = self.station_geometry()
+        if not self.go_to_stage(cx, cy, normal):
+            return False
+        self.refresh_station()
+        cx, cy, normal = self.station_geometry()
+        if not self.go_to_stage(cx, cy, normal):
             return False
         self.turn_to_yaw(normalize_angle(normal + math.pi))
 
@@ -652,14 +700,20 @@ class autonavigation(Node):
         along = 0.0
         started = time.monotonic()
         blocked_since = None
+        self.docking = True
         while rclpy.ok():
             self.spin(0.05)
             if not self.update_pose():
                 continue
-            along = (cx - self.x) * ux + (cy - self.y) * uy
+            live = self.live_centre()
+            if live is None:
+                along = (cx - self.x) * ux + (cy - self.y) * uy
+            else:
+                along = math.hypot(live[0], live[1])
             if along < self.dock_tolerance:
                 break
             if time.monotonic() - started > 120.0:
+                self.docking = False
                 self.stop()
                 self.get_logger().warn('Acoplamiento abortado: tarda demasiado')
                 return False
@@ -667,6 +721,7 @@ class autonavigation(Node):
                 if blocked_since is None:
                     blocked_since = time.monotonic()
                 if time.monotonic() - blocked_since > 5.0:
+                    self.docking = False
                     self.stop()
                     self.get_logger().warn('Acoplamiento abortado: algo bloquea el paso')
                     return False
@@ -675,18 +730,24 @@ class autonavigation(Node):
                                        throttle_duration_sec=2.0)
                 continue
             blocked_since = None
-            axis_x = cx - ux * along
-            axis_y = cy - uy * along
-            ahead = min(0.15, along)
-            target_x = axis_x + ux * ahead
-            target_y = axis_y + uy * ahead
-            error = normalize_angle(math.atan2(target_y - self.y, target_x - self.x) - self.yaw)
-            angular = 2.0 * error
-            if self.left < 0.3 and self.right < 0.3:
-                angular += 1.0 * (self.left - self.right)
-            angular = max(-0.5, min(0.5, angular))
+            if live is not None:
+                error = math.atan2(live[1], live[0])
+                angular = max(-0.5, min(0.5, 2.0 * error))
+            else:
+                axis_x = cx - ux * along
+                axis_y = cy - uy * along
+                ahead = min(0.15, along)
+                target_x = axis_x + ux * ahead
+                target_y = axis_y + uy * ahead
+                error = normalize_angle(
+                    math.atan2(target_y - self.y, target_x - self.x) - self.yaw)
+                angular = 2.0 * error
+                if self.left < 0.3 and self.right < 0.3:
+                    angular += 1.0 * (self.left - self.right)
+                angular = max(-0.5, min(0.5, angular))
             linear = self.dock_speed if abs(error) < 0.3 else 0.0
             self.publish_velocity(linear, angular)
+        self.docking = False
         self.stop()
         self.get_logger().info(f'Acoplado: faltan {max(along, 0.0):.3f} m hasta el centro')
         return True
@@ -718,13 +779,16 @@ class autonavigation(Node):
         self.get_logger().info('Fase I completada')
 
         self.phase = 'II'
+        self.detecting = True
         self.max_linear_speed = self.explore_speed
         if not self.go_path(self.explore_path):
-            self.get_logger().warn('Fase II interrumpida')
-            return
+            if not rclpy.ok():
+                return
+            self.get_logger().warn('Fase II interrumpida: sigo con lo que he visto')
         if self.station is None:
             self.get_logger().warn('Estacion no encontrada: repito el barrido al reves')
             self.go_path(self.explore_path[-2::-1] + [self.explore_path[-1]])
+        self.detecting = False
         self.save_map()
         if self.station is None:
             self.get_logger().error('No se ha encontrado la estacion')
