@@ -23,18 +23,15 @@ def clamp(value, low, high):
     return max(low, min(high, value))
 
 def find_square(points, min_side=0.28, max_side=0.50, allow_three=False):
-    # Busca 4 puntos que formen un cuadrado (los 4 pilares de la estacion).
-    # Si allow_three, vale con 3 esquinas (el cuarto pilar puede quedar tapado por otro).
-    # Devuelve (centro_x, centro_y, lado, orientacion) o None
     best = None
     for combo in itertools.combinations(points[:14], 4):
         d = sorted(math.hypot(a[0] - b[0], a[1] - b[1])
                    for a, b in itertools.combinations(combo, 2))
-        side = sum(d[:4]) / 4 # 4 lados (las 4 distancias cortas)
+        side = sum(d[:4]) / 4
         if not min_side <= side <= max_side:
             continue
         side_dev = max(abs(v - side) for v in d[:4])
-        diag_dev = max(abs(v - side * math.sqrt(2)) for v in d[4:]) # 2 diagonales
+        diag_dev = max(abs(v - side * math.sqrt(2)) for v in d[4:])
         if side_dev > 0.06 or diag_dev > 0.08:
             continue
         if best is None or side_dev + diag_dev < best[0]:
@@ -46,13 +43,11 @@ def find_square(points, min_side=0.28, max_side=0.50, allow_three=False):
     combo, side = best[1], best[2]
     cx = sum(p[0] for p in combo) / 4
     cy = sum(p[1] for p in combo) / 4
-    # esquinas a theta + 45 + k*90 grados: multiplicando por 4 salen todas iguales
     total = sum(cmath.exp(4j * math.atan2(p[1] - cy, p[0] - cx)) for p in combo)
     theta = (cmath.phase(total) - math.pi) / 4
     return cx, cy, side, theta
 
 def find_corner(points, min_side, max_side):
-    # 3 esquinas de un cuadrado: dos lados iguales en angulo recto y la diagonal
     best = None
     for combo in itertools.combinations(points[:14], 3):
         for i in range(3):
@@ -72,9 +67,9 @@ def find_corner(points, min_side, max_side):
     if best is None:
         return None
     _, vertex, p, q, side = best
-    cx = (p[0] + q[0]) / 2 # el centro es la mitad de la diagonal
+    cx = (p[0] + q[0]) / 2
     cy = (p[1] + q[1]) / 2
-    theta = math.atan2(p[1] - vertex[1], p[0] - vertex[0]) # un lado marca los ejes
+    theta = math.atan2(p[1] - vertex[1], p[0] - vertex[0])
     return cx, cy, side, theta
 
 class autonavigation(Node):
@@ -87,11 +82,9 @@ class autonavigation(Node):
         self.odom_sub = self.create_subscription(Odometry, '/odom', self.odom_callback, qos_b)
         self.scan_sub = self.create_subscription(LaserScan, '/scan', self.scan_callback, qos_b)
 
-        # TF para leer la pose del SLAM (map -> base_footprint)
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        #puntos importantes del mapa (deberia saberlo al mapear el entorno)
         self.points = {
             "A" : (0.7,0.92),
             "B" : (3.102,1.722),
@@ -106,50 +99,41 @@ class autonavigation(Node):
             "R" : (7.500, 16.170),
             "S" : (3.540, 14.497),
             "T" : (2.136, 15.300),
-            # puntos de paso (no son del enunciado): cruzar la puerta recto y rodear la pared hacia Q
             "Door_in" : (5.9, 11.75),
             "Door_out" : (7.0, 11.75),
             "Via_Q" : (8.2, 14.3),
-            # barrido del pasillo (linea central de la sala de arriba)
             "Cor_1" : (8.2, 15.45),
             "Cor_2" : (6.5, 15.45),
             "Cor_3" : (4.8, 15.45),
             "Cor_4" : (2.2, 15.45)
         }
 
-        # parametros (la salida y la ruta; el destino de cada tramo sale de self.points)
         self.declare_parameter("start_point", "A")
         self.declare_parameter("start_yaw", 0.0)
-        # fase I: puntos a visitar, sin contar la salida. El ultimo es la pose final (zona 2)
         self.declare_parameter("path", ["B", "C", "D", "E", "F", "G",
                                         "Door_in", "Door", "Door_out", "Via_Q", "Q"])
-        self.declare_parameter("final_yaw", math.pi) # orientacion final de la fase I
-        # fase II: barrido del pasillo (luego vuelve a P_Base)
+        self.declare_parameter("final_yaw", math.pi)
         self.declare_parameter("explore_path", ["Cor_1", "Cor_2", "Cor_3", "Cor_4"])
-        self.declare_parameter("pose_source", "slam") # odom | slam
+        self.declare_parameter("pose_source", "slam")
         self.declare_parameter("log_file", "mission_log.csv")
         self.declare_parameter("map_file", "mapa_robot")
-        self.declare_parameter("start_delay", 5.0) # s de espera antes de moverse (para grabar)
-        # deteccion de pilares (ajustables en el robot real sin tocar el codigo)
-        self.declare_parameter("pillar_max_range", 2.5) # m
-        self.declare_parameter("min_sightings", 15) # veces que hay que ver un pilar
+        self.declare_parameter("start_delay", 5.0)
+        self.declare_parameter("pillar_max_range", 2.5)
+        self.declare_parameter("min_sightings", 15)
 
-        # velocidades
-        self.max_linear_speed = 0.25 # m/s
+        self.max_linear_speed = 0.25
         self.min_linear_speed = 0.08
-        self.max_angular_speed = 0.8 # rad/s
+        self.max_angular_speed = 0.8
         self.min_angular_speed = 0.05
 
-        # constantes de control
         self.k_angular = 2.0
         self.k_linear = 0.5
 
-        # estado actual (pose en MUNDO)
         self.x = None
         self.y = None
         self.yaw = None
-        self.phase = 'INIT' # I, II, III, FIN
-        self.following = None # punto q esta siguiendo el robot
+        self.phase = 'INIT'
+        self.following = None
         self.start_point = self.get_parameter("start_point").value
         self.start_x, self.start_y = self.points[self.start_point]
         self.start_yaw = self.get_parameter("start_yaw").value
@@ -162,73 +146,65 @@ class autonavigation(Node):
         self.goal_x = None
         self.goal_y = None
 
-        # distancias
         self.safe_distance = 0.25
-        self.emergency_distance = 0.13 # m, algo tan cerca (en cualquier direccion): paro
-        self.wait_time = 3.0 # s, espero a ver si un obstaculo se aparta antes de rodearlo
+        self.emergency_distance = 0.13
+        self.wait_time = 3.0
         self.wait_since = None
         self.wall_distance = 0.2
         self.goal_tolerance = 0.12
         self.yaw_tol = 0.08
         self.turn_in_place_angle = 0.3
 
-        # LiDAR
         self.front = None
         self.right = None
-        self.closest = None # lo mas cercano en cualquier direccion
-        self.goal_free = float('inf') # distancia libre en direccion al objetivo
-        self.lidar_offset = -0.032 # m, el LiDAR esta un poco detras del centro del robot
+        self.closest = None
+        self.goal_free = float('inf')
+        self.lidar_offset = -0.032
         self.scan_id = 0
 
-        # Bug2
         self.wall_follow_speed = 0.1
-        self.mline_tolerance = 0.05 # m, estoy en la m-line
-        self.leave_margin = 0.15 # m, cuanto mas cerca que al chocar para salir
-        self.away_dist = 0.5 # m, me he alejado del punto de choque
-        self.back_dist = 0.2 # m, he vuelto al punto de choque
-        self.following_wall = False # False: voy al objetivo, True: rodeo una pared
+        self.mline_tolerance = 0.05
+        self.leave_margin = 0.15
+        self.away_dist = 0.5
+        self.back_dist = 0.2
+        self.following_wall = False
         self.hit_distance = 0.0
         self.hit_x = 0.0
         self.hit_y = 0.0
         self.left_hit = False
         self.unreachable = False
         self.goal_distance = None
-        self.leg_start_x = None # inicio del tramo actual (para la m-line)
+        self.leg_start_x = None
         self.leg_start_y = None
 
-        # Pilares y estacion
         self.pillar_radius = 0.025
-        self.pillar_max_range = self.get_parameter("pillar_max_range").value # mas lejos casi no se ven
-        self.min_sightings = self.get_parameter("min_sightings").value # las esquinas de pared
-                                # que parecen pilares se ven pocas veces
-        self.pillars = [] # pilares del ultimo scan, en el marco del robot
-        self.landmarks = [] # pilares acumulados en mundo: [x, y, veces]
+        self.pillar_max_range = self.get_parameter("pillar_max_range").value
+        self.min_sightings = self.get_parameter("min_sightings").value
+        self.pillars = []
+        self.landmarks = []
         self.last_scan_used = -1
-        self.station = None # (x, y, lado, orientacion) en mundo
-        self.staging_distance = 0.9 # m, punto de espera delante de la estacion
-        self.dock_tolerance = 0.03 # m, error final en el centro de la estacion
-        self.lateral_tolerance = 0.04 # m, desalineacion maxima para entrar
+        self.station = None
+        self.staging_distance = 0.9
+        self.dock_tolerance = 0.03
+        self.lateral_tolerance = 0.04
 
         self.pose_source = self.get_parameter("pose_source").value
 
-        # Odometria cruda (marco del robot, empieza donde arranco)
         self.odom_x = None
         self.odom_y = None
         self.odom_yaw = None
 
-        # Primera lectura de la fuente: es el origen para pasar a mundo
         self.x0 = None
         self.y0 = None
         self.yaw0 = None
 
-        # Log de mision (CSV)
         self.log_file = open(self.get_parameter("log_file").value, 'w', newline='')
         self.log_writer = csv.writer(self.log_file)
         self.log_writer.writerow(['timestamp', 'current_phase', 'robot_x', 'robot_y',
                                   'robot_yaw', 'obstacle_front_m', 'pillars_detected',
                                   'station_x', 'station_y'])
         self.last_log = -1.0
-        self.log_period = 0.5 # s
+        self.log_period = 0.5
         self.map_saved = False
 
     def odom_callback(self, msg):
@@ -268,12 +244,10 @@ class autonavigation(Node):
         self.scan_id += 1
 
     def detect_pillars(self, msg):
-        # Objetos pequenos y aislados (candidatos a pilar). Devuelve (x, y) en el marco del robot
         n = len(msg.ranges)
         valid = [(not math.isinf(r) and not math.isnan(r) and r >= msg.range_min)
                  for r in msg.ranges]
 
-        # agrupar rayos consecutivos con distancias parecidas
         clusters = []
         current = []
         for i in range(n):
@@ -285,7 +259,6 @@ class autonavigation(Node):
                 current = [i] if valid[i] else []
         if current:
             clusters.append(current)
-        # el rayo 359 y el 0 son vecinos (justo delante del robot)
         if len(clusters) > 1 and clusters[0][0] == 0 and clusters[-1][-1] == n - 1 \
                 and abs(msg.ranges[0] - msg.ranges[n - 1]) < 0.08:
             clusters[0] = clusters.pop() + clusters[0]
@@ -302,13 +275,10 @@ class autonavigation(Node):
                                ranges[0] * math.sin(first) - ranges[-1] * math.sin(last))
             if width > 0.12:
                 continue
-            # un pilar esta aislado: lo que hay a sus lados esta a otra distancia (una pared
-            # seguiria a una distancia parecida)
             before = msg.ranges[(cluster[0] - 1) % n] if valid[(cluster[0] - 1) % n] else float('inf')
             after = msg.ranges[(cluster[-1] + 1) % n] if valid[(cluster[-1] + 1) % n] else float('inf')
             if abs(before - mean_range) < 0.12 or abs(after - mean_range) < 0.12:
                 continue
-            # centro: el LiDAR ve la cara, el centro esta un radio mas atras
             angles = [msg.angle_min + i * msg.angle_increment for i in cluster]
             angle = math.atan2(sum(math.sin(a) for a in angles),
                                sum(math.cos(a) for a in angles))
@@ -317,7 +287,6 @@ class autonavigation(Node):
         return pillars
 
     def update_landmarks(self):
-        # Acumula los pilares en el mundo y busca el cuadrado de la estacion
         if self.scan_id == self.last_scan_used:
             return
         self.last_scan_used = self.scan_id
@@ -335,7 +304,6 @@ class autonavigation(Node):
                     break
             else:
                 self.landmarks.append([wx, wy, 1])
-        # los mas vistos primero: find_square solo mira los 14 primeros
         confirmed = [(lm[0], lm[1]) for lm in sorted(self.landmarks, key=lambda lm: -lm[2])
                      if lm[2] >= self.min_sightings]
         square = find_square(confirmed)
@@ -351,7 +319,6 @@ class autonavigation(Node):
         if now - self.last_log < self.log_period:
             return
         self.last_log = now
-        # solo los pilares junto a la estacion (el resto de objetos pequenos son esquinas de pared)
         pillars = ''
         if self.station is not None:
             pillars = ';'.join(
@@ -366,7 +333,6 @@ class autonavigation(Node):
         self.log_file.flush()
 
     def slam_pose(self):
-        # Pose del SLAM en el marco del mapa. None si la TF todavia no existe
         try:
             t = self.tf_buffer.lookup_transform('map', 'base_footprint', Time())
         except tf2_ros.TransformException:
@@ -376,7 +342,6 @@ class autonavigation(Node):
                 yaw_from_quaternion(t.transform.rotation))
 
     def to_world(self, x, y, yaw):
-        # Pasa una pose del marco del arranque al mundo del enunciado
         if self.x0 is None:
             self.x0, self.y0, self.yaw0 = x, y, yaw
         a = self.start_yaw - self.yaw0
@@ -388,7 +353,6 @@ class autonavigation(Node):
         return x_w, y_w, yaw_w
 
     def get_pose(self):
-        # Pose (x, y, yaw) en mundo segun pose_source. None si aun no hay dato
         if self.pose_source == "slam":
             raw = self.slam_pose()
         else:
@@ -422,7 +386,6 @@ class autonavigation(Node):
         rclpy.spin_once(self, timeout_sec=0.1)
 
     def set_goal(self, name):
-        # Nuevo tramo: la m-line va de donde estoy ahora al punto name
         self.following = name
         self.goal_x, self.goal_y = self.points[name]
         self.leg_start_x = self.x
@@ -433,7 +396,6 @@ class autonavigation(Node):
         self.wait_since = None
 
     def follow_line(self):
-        # Voy hacia el objetivo. Si hay un obstaculo delante, paso a rodearlo
         goal_angle = math.atan2(self.goal_y - self.y, self.goal_x - self.x)
         error = normalize_angle(goal_angle - self.yaw)
         angular = clamp(self.k_angular * error, -self.max_angular_speed, self.max_angular_speed)
@@ -442,7 +404,6 @@ class autonavigation(Node):
             angular = math.copysign(max(abs(angular), self.min_angular_speed), error)
             self.publish_velocity(0.0, angular)
         elif self.front < self.safe_distance and self.front < self.goal_distance:
-            # primero espero: si es algo que se mueve, se apartara y sigo sin rodear
             now = self.get_clock().now().nanoseconds / 1e9
             if self.wait_since is None:
                 self.wait_since = now
@@ -465,7 +426,6 @@ class autonavigation(Node):
             self.publish_velocity(linear, angular)
 
     def follow_wall(self):
-        # Rodeo la pared por la derecha hasta volver a la m-line (o a tener camino libre)
         dx = self.goal_x - self.leg_start_x
         dy = self.goal_y - self.leg_start_y
         leg_length = math.hypot(dx, dy)
@@ -497,7 +457,6 @@ class autonavigation(Node):
             self.publish_velocity(self.wall_follow_speed, angular)
 
     def go_to_goal(self):
-        # Un paso de control hacia (goal_x, goal_y) con Bug2. True si ya ha llegado
         self.goal_distance = math.hypot(self.goal_x - self.x, self.goal_y - self.y)
         if self.goal_distance < self.goal_tolerance:
             self.stop()
@@ -506,7 +465,6 @@ class autonavigation(Node):
             self.stop()
             return True
         if self.closest < self.emergency_distance:
-            # algo muy cerca en cualquier direccion (tambien a los lados): no me muevo
             self.publish_velocity(0.0, 0.0)
             self.get_logger().warn(f'Algo a {self.closest:.2f} m: parado',
                                    throttle_duration_sec=2.0)
@@ -518,7 +476,6 @@ class autonavigation(Node):
         return False
 
     def go_path(self, names):
-        # Recorre los puntos en orden. False si se interrumpe o algun punto es inalcanzable
         for name in names:
             self.set_goal(name)
             self.get_logger().info(f'Voy a {name} {self.points[name]}')
@@ -540,7 +497,6 @@ class autonavigation(Node):
         return True
 
     def turn_to_yaw(self, target_yaw):
-        # Giro en el sitio hasta la orientacion target_yaw
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.05)
             if not self.update_pose():
@@ -548,7 +504,7 @@ class autonavigation(Node):
             error = normalize_angle(target_yaw - self.yaw)
             if abs(error) <= self.yaw_tol:
                 break
-            if self.closest < self.emergency_distance: # girar rozaria con lo que hay al lado
+            if self.closest < self.emergency_distance:
                 self.publish_velocity(0.0, 0.0)
                 continue
             angular = clamp(self.k_angular * error, -self.max_angular_speed,
@@ -558,7 +514,6 @@ class autonavigation(Node):
         self.stop()
 
     def countdown(self, seconds):
-        # Cuenta atras con el robot quieto, para dar tiempo a empezar a grabar
         end = self.get_clock().now().nanoseconds / 1e9 + seconds
         last = None
         while rclpy.ok():
@@ -572,7 +527,6 @@ class autonavigation(Node):
             self.update_pose()
 
     def look_around(self, seconds):
-        # Parado, solo mira: con el robot quieto las observaciones de los pilares son coherentes
         self.stop()
         end = self.get_clock().now().nanoseconds / 1e9 + seconds
         while rclpy.ok() and self.get_clock().now().nanoseconds / 1e9 < end:
@@ -580,7 +534,6 @@ class autonavigation(Node):
             self.update_pose()
 
     def save_map(self):
-        # Guarda el mapa del SLAM (.pgm + .yaml) con nav2_map_server
         name = self.get_parameter("map_file").value
         sim = self.get_parameter("use_sim_time").value
         self.get_logger().info(f'Guardando el mapa en {name}.yaml / {name}.pgm')
@@ -600,13 +553,10 @@ class autonavigation(Node):
             self.get_logger().warn(
                 f'map_saver_cli ha fallado (intento {attempt}/3): '
                 f'{(result.stderr or result.stdout)[-300:]}')
-            self.look_around(2.0) # el SLAM sigue publicando; espero y reintento
+            self.look_around(2.0)
         return False
 
     def square_from_pair(self, points, min_side=0.28, max_side=0.50):
-        # Entrando de frente los 2 pilares de atras quedan tapados: con los 2 de delante,
-        # el centro esta media diagonal hacia dentro. Solo vale si coincide con el centro
-        # conocido (self.dock_centre, en mundo: el de la fase II o el ultimo medido con 3-4 pilares)
         c = math.cos(self.yaw)
         s = math.sin(self.yaw)
         best = None
@@ -616,9 +566,9 @@ class autonavigation(Node):
                 continue
             mx = (p[0] + q[0]) / 2
             my = (p[1] + q[1]) / 2
-            nx = -(q[1] - p[1]) / side # normal al par
+            nx = -(q[1] - p[1]) / side
             ny = (q[0] - p[0]) / side
-            if nx * mx + ny * my < 0: # que apunte hacia dentro (lejos del robot)
+            if nx * mx + ny * my < 0:
                 nx, ny = -nx, -ny
             cx = mx + nx * side / 2
             cy = my + ny * side / 2
@@ -630,11 +580,9 @@ class autonavigation(Node):
         return None if best is None else best[1]
 
     def dock(self):
-        # Fase III: ir al punto de espera delante de la estacion y entrar guiandose por los pilares
         cx, cy, side, theta = self.station
-        self.dock_centre = (cx, cy) # de momento, el centro estimado en la fase II
+        self.dock_centre = (cx, cy)
 
-        # lado de entrada: la normal del cuadrado que mira hacia donde estoy
         best = None
         for k in range(4):
             a = theta + k * math.pi / 2
@@ -646,7 +594,7 @@ class autonavigation(Node):
                                 cy + self.staging_distance * math.sin(angle))
         if not self.go_path(['Stage']):
             return False
-        self.turn_to_yaw(normalize_angle(angle + math.pi)) # mirando al centro
+        self.turn_to_yaw(normalize_angle(angle + math.pi))
 
         lost_since = None
         start = self.get_clock().now().nanoseconds / 1e9
@@ -662,12 +610,10 @@ class autonavigation(Node):
             near = [p for p in self.pillars if math.hypot(p[0], p[1]) < 1.6]
             square = find_square(near, allow_three=True)
             if square is not None:
-                # centro en mundo, por si mas adelante los pilares de atras quedan tapados
                 c = math.cos(self.yaw)
                 s = math.sin(self.yaw)
                 self.dock_centre = (self.x + square[0] * c - square[1] * s,
                                     self.y + square[0] * s + square[1] * c)
-                # medida del LiDAR de cerca: mas precisa que la de la fase II
                 self.station = (self.dock_centre[0], self.dock_centre[1],
                                 square[2], self.station[3])
             elif self.dock_centre is not None:
@@ -682,7 +628,7 @@ class autonavigation(Node):
                     break
                 continue
             lost_since = None
-            sx, sy, side, theta = square # centro de la estacion en el marco del robot
+            sx, sy, side, theta = square
 
             distance = math.hypot(sx, sy)
             if distance < self.dock_tolerance:
@@ -691,7 +637,6 @@ class autonavigation(Node):
                     f'Acoplado: el centro de la estacion esta a {distance:.3f} m del robot')
                 return True
 
-            # eje de entrada: la normal del cuadrado que apunta hacia el robot
             best = None
             for k in range(4):
                 a = theta + k * math.pi / 2
@@ -700,12 +645,11 @@ class autonavigation(Node):
                     best = (score, a)
             along = best[0]
             ux, uy = math.cos(best[1]), math.sin(best[1])
-            lateral = -sx * (-uy) - sy * ux # desalineacion respecto al eje
+            lateral = -sx * (-uy) - sy * ux
             lateral = abs(lateral)
 
-            # punto al que apunto: sobre el eje, un poco mas cerca que yo
             if lateral > self.lateral_tolerance:
-                along_target = max(along - 0.25, 0.55) # primero me alineo
+                along_target = max(along - 0.25, 0.55)
             else:
                 along_target = max(along - 0.25, 0.0)
             tx = sx + ux * along_target
@@ -722,7 +666,6 @@ class autonavigation(Node):
         return False
 
     def run(self):
-        # esperar a tener pose y lectura del LiDAR
         while rclpy.ok() and not (self.update_pose() and self.front is not None):
             rclpy.spin_once(self, timeout_sec=0.1)
         self.get_logger().info(
@@ -730,23 +673,20 @@ class autonavigation(Node):
             f'yaw={math.degrees(self.yaw):.1f} grados ({self.pose_source})')
         self.countdown(self.get_parameter("start_delay").value)
 
-        # FASE I: navegacion global hasta la pose final (zona 2)
         self.phase = 'I'
         if not self.go_path(self.path):
             return
         self.turn_to_yaw(self.final_yaw)
         self.get_logger().info('Fase I completada')
 
-        # FASE II: barrer el pasillo buscando la estacion y volver a P_Base
         self.phase = 'II'
-        self.max_linear_speed = 0.15 # mas despacio para ver bien los pilares
+        self.max_linear_speed = 0.15
         if not self.go_path(self.explore_path + ['P_Base']):
             return
         if self.station is None:
             self.get_logger().warn('Estacion sin confirmar: miro parado desde P_Base')
             self.look_around(5.0)
         if self.station is None:
-            # segunda pasada, en sentido contrario, para ver los pilares desde otro lado
             self.get_logger().warn('Estacion sin confirmar: segunda pasada del pasillo')
             if not self.go_path(list(reversed(self.explore_path)) + ['P_Base']):
                 return
@@ -760,7 +700,6 @@ class autonavigation(Node):
             return
         self.get_logger().info('Fase II completada')
 
-        # FASE III: acoplamiento de precision
         self.phase = 'III'
         if self.dock():
             self.phase = 'FIN'
@@ -782,10 +721,9 @@ def main(args=None):
         if rclpy.ok():
             node.publisher.publish(TwistStamped())
         if not node.map_saved and node.x is not None:
-            # la mision se ha interrumpido: guardo igualmente el mapa que haya hasta ahora
             try:
                 node.save_map()
-            except Exception as error: # noqa: el mapa es un extra, no debe tapar el cierre
+            except Exception as error:
                 print(f'No se ha podido guardar el mapa: {error}')
         node.close_log()
         node.destroy_node()
