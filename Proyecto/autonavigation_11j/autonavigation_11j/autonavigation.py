@@ -1,11 +1,13 @@
 import csv
-import itertools
 import math
+import os
 import subprocess
+import time
 import rclpy
 import tf2_ros
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.signals import SignalHandlerOptions
 from rclpy.time import Time
 from geometry_msgs.msg import TwistStamped
 from sensor_msgs.msg import LaserScan
@@ -40,12 +42,13 @@ class autonavigation(Node):
             "Q" : (8.970, 14.497),
             "R" : (7.500, 16.170),
             "S" : (3.540, 14.497),
-            "T" : (2.136, 15.300)
+            "T" : (2.136, 15.300),
+            "Via_Q" : (8.2, 14.3)
         }
 
         self.declare_parameter("start_point", "A")
         self.declare_parameter("start_yaw", 0.0)
-        self.declare_parameter("path", ["B", "C", "D", "E", "F", "G", "Door", "Q"])
+        self.declare_parameter("path", ["E", "G", "Door", "Via_Q", "Q"])
         self.start_point = self.get_parameter("start_point").value
         self.initial_x, self.initial_y = self.points[self.start_point]
         self.initial_yaw = self.get_parameter("start_yaw").value
@@ -65,7 +68,7 @@ class autonavigation(Node):
         self.declare_parameter("log_file", "mission_log.csv")
         self.declare_parameter("map_file", "mapa_robot")
         self.declare_parameter("min_sightings", 15)
-        self.declare_parameter("pillar_max_range", 2.5)
+        self.declare_parameter("pillar_max_range", 2.0)
         self.pose_source = self.get_parameter("pose_source").value
         self.explore_path = list(self.get_parameter("explore_path").value)
         self.map_file = self.get_parameter("map_file").value
@@ -83,11 +86,12 @@ class autonavigation(Node):
         self.goal_tolerance = 0.08
         self.mline_tolerance = 0.05
         self.leave_margin = 0.15
-        self.yaw_tol = 0.3
+        self.turn_start = 0.5
+        self.turn_end = 0.1
         self.away_dist = 0.5
         self.back_dist = 0.2
         self.emergency_distance = 0.13
-        self.wait_time = 3.0
+        self.wait_time = 1.0
         self.turn_tolerance = 0.08
         self.door_speed = 0.1
         self.explore_speed = 0.15
@@ -100,7 +104,7 @@ class autonavigation(Node):
         self.stage_distance = 0.8
         self.dock_speed = 0.05
         self.dock_tolerance = 0.03
-        self.dock_emergency = 0.09
+        self.dock_emergency = 0.13
 
         self.odom_x = None
         self.odom_y = None
@@ -131,6 +135,8 @@ class autonavigation(Node):
         self.left_hit = False
         self.unreachable = False
         self.wait_since = None
+        self.emergency_since = None
+        self.turning = False
 
         self.phase = 'I'
         self.pillars = []
@@ -144,10 +150,18 @@ class autonavigation(Node):
         self.log_file = open(self.get_parameter("log_file").value, 'w', newline='')
         self.log_writer = csv.writer(self.log_file)
         self.log_writer.writerow(['timestamp', 'current_phase', 'robot_x', 'robot_y',
-                                  'robot_yaw', 'obstacle_front_m', 'pillars_detected',
+                                  'robot_yaw', 'obstacle_x', 'obstacle_y', 'pillars_detected',
                                   'station_x', 'station_y'])
         self.last_log = 0.0
         self.log_period = 0.5
+        self.last_cmd = 0.0
+        self.cmd_period = 0.05
+        self.cmd_linear = 0.0
+        self.cmd_angular = 0.0
+        self.max_linear_accel = 0.4
+        self.max_angular_accel = 3.0
+        self.last_angular = 0.0
+        self.last_scan_time = None
 
 
     def odom_callback(self, msg):
@@ -158,10 +172,11 @@ class autonavigation(Node):
         self.odom_y = msg.pose.pose.position.y
 
     def scan_callback(self, msg):
+        self.last_scan_time = self.get_clock().now().nanoseconds / 1e9
         front = float('inf')
         right = float('inf')
         left = float('inf')
-        closest = float('inf')
+        near = []
         goal_free = float('inf')
 
         goal_direction = 0.0
@@ -172,9 +187,10 @@ class autonavigation(Node):
         for i, r in enumerate(msg.ranges):
             if math.isinf(r) or math.isnan(r) or r < msg.range_min:
                 continue
-            closest = min(closest, r)
             angle = math.degrees(
                 normalize_angle(msg.angle_min + i * msg.angle_increment))
+            if -60 <= angle <= 60:
+                near.append(r)
             if -30 <= angle <= 30:
                 front = min(front, r)
             elif -110 <= angle < -30:
@@ -187,7 +203,8 @@ class autonavigation(Node):
         self.front = front
         self.right = right
         self.left = left
-        self.closest = closest
+        near.sort()
+        self.closest = near[2] if len(near) >= 3 else float('inf')
         self.goal_free = goal_free
 
         if self.phase == 'II':
@@ -238,6 +255,8 @@ class autonavigation(Node):
         if self.scan_id == self.last_scan_id:
             return
         self.last_scan_id = self.scan_id
+        if abs(self.last_angular) > 0.2:
+            return
         for px, py in self.pillars:
             wx = self.x + px * math.cos(self.yaw) - py * math.sin(self.yaw)
             wy = self.y + px * math.sin(self.yaw) + py * math.cos(self.yaw)
@@ -252,29 +271,41 @@ class autonavigation(Node):
         self.find_station()
 
     def find_station(self):
-        if self.station is not None:
-            return
         good = [lm for lm in self.landmarks if lm[2] >= self.min_sightings]
+        best = None
         for seed in good:
             near = sorted(good, key=lambda lm: math.hypot(lm[0] - seed[0], lm[1] - seed[1]))[:4]
             if len(near) < 4:
                 continue
-            dists = [math.hypot(a[0] - b[0], a[1] - b[1])
-                     for i, a in enumerate(near) for b in near[i + 1:]]
-            if max(dists) < 0.7 and min(dists) > 0.25:
-                cx = sum(lm[0] for lm in near) / 4
-                cy = sum(lm[1] for lm in near) / 4
-                self.station = (cx, cy)
-                self.station_pillars = [(lm[0], lm[1]) for lm in near]
-                self.get_logger().info(f'Estacion encontrada: centro=({cx:.2f}, {cy:.2f})')
-                return
+            dists = sorted(math.hypot(a[0] - b[0], a[1] - b[1])
+                           for i, a in enumerate(near) for b in near[i + 1:])
+            sides = dists[:4]
+            diagonals = dists[4:]
+            if min(sides) > 0.28 and max(sides) < 0.52 \
+                    and min(diagonals) > 0.40 and max(diagonals) < 0.70:
+                total = sum(lm[2] for lm in near)
+                if best is None or total > best[0]:
+                    best = (total, near)
+        if best is None:
+            return
+        near = best[1]
+        cx = sum(lm[0] for lm in near) / 4
+        cy = sum(lm[1] for lm in near) / 4
+        if self.station is None:
+            self.get_logger().info(f'Estacion encontrada: centro=({cx:.2f}, {cy:.2f})')
+        self.station = (cx, cy)
+        self.station_pillars = [(lm[0], lm[1]) for lm in near]
 
     def log_row(self):
         now = self.get_clock().now().nanoseconds / 1e9
         if now - self.last_log < self.log_period:
             return
         self.last_log = now
-        obstacle = f'{self.front:.2f}' if self.front is not None and self.front < 3.0 else ''
+        obstacle_x = ''
+        obstacle_y = ''
+        if self.front is not None and self.front < 3.0:
+            obstacle_x = f'{self.x + self.front * math.cos(self.yaw):.2f}'
+            obstacle_y = f'{self.y + self.front * math.sin(self.yaw):.2f}'
         pillars = ';'.join(f'{p[0]:.2f}:{p[1]:.2f}' for p in self.station_pillars)
         station_x = ''
         station_y = ''
@@ -282,13 +313,18 @@ class autonavigation(Node):
             station_x = f'{self.station[0]:.3f}'
             station_y = f'{self.station[1]:.3f}'
         self.log_writer.writerow([f'{now:.2f}', self.phase, f'{self.x:.3f}', f'{self.y:.3f}',
-                                  f'{self.yaw:.3f}', obstacle, pillars, station_x, station_y])
+                                  f'{self.yaw:.3f}', obstacle_x, obstacle_y, pillars,
+                                  station_x, station_y])
         self.log_file.flush()
 
     def slam_pose(self):
         try:
             t = self.tf_buffer.lookup_transform('map', 'base_footprint', Time())
         except tf2_ros.TransformException:
+            return None
+        now = self.get_clock().now().nanoseconds / 1e9
+        stamp = t.header.stamp.sec + t.header.stamp.nanosec * 1e-9
+        if now - stamp > 1.5:
             return None
         q = t.transform.rotation
         yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
@@ -303,6 +339,8 @@ class autonavigation(Node):
         else:
             raw = None
         if raw is None:
+            if self.x is not None:
+                self.publish_velocity(0.0, 0.0)
             return False
         x, y, yaw = raw
         if self.x0 is None:
@@ -320,17 +358,48 @@ class autonavigation(Node):
         self.log_row()
         return True
 
-    def publish_velocity(self, linear, angular):
+    def publish_velocity(self, linear, angular, force=False):
+        now = self.get_clock().now().nanoseconds / 1e9
+        elapsed = now - self.last_cmd
+        if not force and 0.0 <= elapsed < self.cmd_period:
+            return
+        dt = elapsed if 0.0 < elapsed < 0.5 else self.cmd_period
+        self.last_cmd = now
+        if not force and self.last_scan_time is not None \
+                and now - self.last_scan_time > 1.0:
+            linear = 0.0
+            angular = 0.0
+            self.get_logger().warn('Sin datos del LiDAR desde hace mas de 1 s: parado',
+                                   throttle_duration_sec=2.0)
+        if force or (linear == 0.0 and angular == 0.0):
+            self.cmd_linear = linear
+            self.cmd_angular = angular
+        else:
+            if linear < self.cmd_linear:
+                self.cmd_linear = linear
+            else:
+                self.cmd_linear = min(linear, self.cmd_linear + self.max_linear_accel * dt)
+            step = self.max_angular_accel * dt
+            self.cmd_angular = max(self.cmd_angular - step, min(self.cmd_angular + step, angular))
+        self.last_angular = self.cmd_angular
         msg = TwistStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = ''
-        msg.twist.linear.x = linear
-        msg.twist.angular.z = angular
+        msg.twist.linear.x = self.cmd_linear
+        msg.twist.angular.z = self.cmd_angular
         self.publisher.publish(msg)
 
+    def spin(self, seconds):
+        end = time.monotonic() + seconds
+        while rclpy.ok():
+            remaining = end - time.monotonic()
+            if remaining <= 0.0:
+                break
+            rclpy.spin_once(self, timeout_sec=remaining)
+
     def stop(self):
-        self.publish_velocity(0.0, 0.0)
-        rclpy.spin_once(self, timeout_sec=0.1)
+        self.publish_velocity(0.0, 0.0, force=True)
+        self.spin(0.1)
 
     def set_goal(self, name):
         self.goal_x, self.goal_y = self.points[name]
@@ -340,14 +409,31 @@ class autonavigation(Node):
         self.left_hit = False
         self.unreachable = False
         self.wait_since = None
+        self.emergency_since = None
+        self.turning = False
+
+
+    def start_wall_following(self):
+        self.following_wall = True
+        self.hit_distance = self.goal_distance
+        self.hit_x = self.x
+        self.hit_y = self.y
+        self.left_hit = False
 
 
     def follow_line(self):
         goal_angle = math.atan2(self.goal_y - self.y, self.goal_x - self.x)
         error = normalize_angle(goal_angle - self.yaw)
-        angular = max(-self.max_angular_speed, min(self.max_angular_speed, 2.0 * error))
 
-        if abs(error) > self.yaw_tol:
+        start = self.turn_start if self.goal_distance > 0.3 else 1.2
+        if abs(error) > start:
+            self.turning = True
+        elif abs(error) < self.turn_end:
+            self.turning = False
+
+        if self.turning:
+            angular = max(-self.max_angular_speed, min(self.max_angular_speed, 2.0 * error))
+            angular = math.copysign(max(abs(angular), 0.15), error)
             self.publish_velocity(0.0, angular)
         elif self.front < self.safe_distance and self.front < self.goal_distance:
             now = self.get_clock().now().nanoseconds / 1e9
@@ -358,25 +444,28 @@ class autonavigation(Node):
                 self.publish_velocity(0.0, 0.0)
                 return
             self.wait_since = None
-            self.following_wall = True
-            self.hit_distance = self.goal_distance
-            self.hit_x = self.x
-            self.hit_y = self.y
-            self.left_hit = False
+            self.start_wall_following()
             self.get_logger().info(f'Obstaculo a {self.front:.2f} m: rodeo la pared')
             self.stop()
         else:
             self.wait_since = None
             linear = max(self.min_linear_speed,
                          min(self.max_linear_speed, self.k_linear * self.goal_distance))
+            linear = min(linear, max(self.min_linear_speed, self.front - self.safe_distance))
+            angular = 0.0
+            if self.goal_distance > 0.3:
+                angular = max(-0.3, min(0.3, 1.0 * error))
             self.publish_velocity(linear, angular)
 
 
     def follow_wall(self):
         dx = self.goal_x - self.start_x
         dy = self.goal_y - self.start_y
-        mline_distance = abs(dx * (self.y - self.start_y) - dy * (self.x - self.start_x)) \
-            / math.hypot(dx, dy)
+        leg_length = math.hypot(dx, dy)
+        mline_distance = 0.0
+        if leg_length > 0.0:
+            mline_distance = abs(dx * (self.y - self.start_y)
+                                 - dy * (self.x - self.start_x)) / leg_length
 
         hit_dist = math.hypot(self.x - self.hit_x, self.y - self.hit_y)
         if hit_dist > self.away_dist:
@@ -409,8 +498,19 @@ class autonavigation(Node):
             self.stop()
             return True
         if self.closest < self.emergency_distance:
-            self.publish_velocity(0.0, 0.0)
-            return False
+            now = self.get_clock().now().nanoseconds / 1e9
+            if self.emergency_since is None:
+                self.emergency_since = now
+            if now - self.emergency_since < self.wait_time:
+                self.publish_velocity(0.0, 0.0)
+                self.get_logger().warn(f'Algo a {self.closest:.2f} m delante: parado',
+                                       throttle_duration_sec=2.0)
+                return False
+            if not self.following_wall:
+                self.start_wall_following()
+                self.get_logger().info('Obstaculo muy cerca: rodeo la pared')
+        else:
+            self.emergency_since = None
         if self.following_wall:
             self.follow_wall()
         else:
@@ -423,7 +523,7 @@ class autonavigation(Node):
             self.set_goal(name)
             self.get_logger().info(f'Voy a {name} {self.points[name]}')
             while rclpy.ok():
-                rclpy.spin_once(self, timeout_sec=0.05)
+                self.spin(0.05)
                 if not self.update_pose():
                     continue
                 if self.go_to_goal():
@@ -442,15 +542,23 @@ class autonavigation(Node):
         self.turn_to_yaw(self.door_yaw)
         door_x = self.x
         door_y = self.y
+        blocked_since = None
         while rclpy.ok():
-            rclpy.spin_once(self, timeout_sec=0.05)
+            self.spin(0.05)
             if not self.update_pose():
                 continue
             if math.hypot(self.x - door_x, self.y - door_y) >= self.door_length:
                 break
             if self.closest < self.emergency_distance or self.front < self.safe_distance:
+                now = self.get_clock().now().nanoseconds / 1e9
+                if blocked_since is None:
+                    blocked_since = now
+                if now - blocked_since > self.wait_time:
+                    self.get_logger().warn('Puerta bloqueada: sigo hacia el siguiente punto')
+                    break
                 self.publish_velocity(0.0, 0.0)
                 continue
+            blocked_since = None
             error = min(self.left, 1.0) - min(self.right, 1.0)
             angular = max(-0.5, min(0.5, 1.5 * error))
             self.publish_velocity(self.door_speed, angular)
@@ -458,16 +566,23 @@ class autonavigation(Node):
 
 
     def turn_to_yaw(self, target_yaw):
+        blocked_since = None
         while rclpy.ok():
-            rclpy.spin_once(self, timeout_sec=0.05)
+            self.spin(0.05)
             if not self.update_pose():
                 continue
             error = normalize_angle(target_yaw - self.yaw)
             if abs(error) <= self.turn_tolerance:
                 break
             if self.closest < self.emergency_distance:
-                self.publish_velocity(0.0, 0.0)
-                continue
+                now = self.get_clock().now().nanoseconds / 1e9
+                if blocked_since is None:
+                    blocked_since = now
+                if now - blocked_since < self.wait_time:
+                    self.publish_velocity(0.0, 0.0)
+                    continue
+            else:
+                blocked_since = None
             angular = max(-self.max_angular_speed, min(self.max_angular_speed, 2.0 * error))
             angular = math.copysign(max(abs(angular), 0.15), error)
             self.publish_velocity(0.0, angular)
@@ -484,25 +599,27 @@ class autonavigation(Node):
             if math.ceil(remaining) != last:
                 last = math.ceil(remaining)
                 self.get_logger().info(f'Empiezo en {last} s')
-            rclpy.spin_once(self, timeout_sec=0.05)
+            self.spin(0.05)
             self.update_pose()
 
 
     def save_map(self):
         self.get_logger().info(f'Guardando el mapa en {self.map_file}.yaml / .pgm')
-        for attempt in range(2):
-            try:
-                result = subprocess.run(
-                    ['ros2', 'run', 'nav2_map_server', 'map_saver_cli', '-f', self.map_file],
-                    capture_output=True, text=True, timeout=30)
-                if result.returncode == 0:
-                    self.map_saved = True
-                    self.get_logger().info('Mapa guardado')
-                    return
-                self.get_logger().warn(f'map_saver_cli ha fallado: {result.stderr[-300:]}')
-            except (subprocess.TimeoutExpired, OSError) as error:
-                self.get_logger().warn(f'map_saver_cli ha fallado: {error}')
-        self.get_logger().error('No se ha podido guardar el mapa')
+        path = os.path.abspath(self.map_file)
+        started = time.time()
+        command = ['ros2', 'service', 'call', '/slam_toolbox/save_map',
+                   'slam_toolbox/srv/SaveMap', "{name: {data: '" + path + "'}}"]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        except (subprocess.TimeoutExpired, OSError) as error:
+            self.get_logger().error(f'No se ha podido guardar el mapa: {error}')
+            return
+        if result.returncode == 0 and os.path.exists(path + '.pgm') \
+                and os.path.getmtime(path + '.pgm') >= started - 1.0:
+            self.map_saved = True
+            self.get_logger().info('Mapa guardado')
+        else:
+            self.get_logger().error(f'No se ha podido guardar el mapa: {result.stderr[-200:]}')
 
 
     def dock(self):
@@ -533,18 +650,31 @@ class autonavigation(Node):
         ux = -math.cos(normal)
         uy = -math.sin(normal)
         along = 0.0
+        started = time.monotonic()
+        blocked_since = None
         while rclpy.ok():
-            rclpy.spin_once(self, timeout_sec=0.05)
+            self.spin(0.05)
             if not self.update_pose():
                 continue
             along = (cx - self.x) * ux + (cy - self.y) * uy
             if along < self.dock_tolerance:
                 break
+            if time.monotonic() - started > 120.0:
+                self.stop()
+                self.get_logger().warn('Acoplamiento abortado: tarda demasiado')
+                return False
             if self.closest < self.dock_emergency:
+                if blocked_since is None:
+                    blocked_since = time.monotonic()
+                if time.monotonic() - blocked_since > 5.0:
+                    self.stop()
+                    self.get_logger().warn('Acoplamiento abortado: algo bloquea el paso')
+                    return False
                 self.publish_velocity(0.0, 0.0)
                 self.get_logger().warn(f'Algo a {self.closest:.2f} m: parado',
                                        throttle_duration_sec=2.0)
                 continue
+            blocked_since = None
             axis_x = cx - ux * along
             axis_y = cy - uy * along
             ahead = min(0.15, along)
@@ -565,11 +695,15 @@ class autonavigation(Node):
     def run(self):
         waited = 0
         while rclpy.ok():
-            rclpy.spin_once(self, timeout_sec=0.1)
+            self.spin(0.1)
             if self.update_pose() and self.front is not None:
                 break
             waited += 1
-            if waited % 50 == 0:
+            if waited == 100 and self.pose_source == "slam" and self.slam_pose() is None:
+                self.get_logger().warn('Sin pose del SLAM tras 10 s: uso la odometria '
+                                       '(no se generara mapa)')
+                self.pose_source = "odom"
+            elif waited % 50 == 0:
                 self.get_logger().warn('Sin pose o sin LiDAR todavia: esta el SLAM en marcha? '
                                        '(o prueba con -p pose_source:=odom)')
         self.get_logger().info(
@@ -588,6 +722,9 @@ class autonavigation(Node):
         if not self.go_path(self.explore_path):
             self.get_logger().warn('Fase II interrumpida')
             return
+        if self.station is None:
+            self.get_logger().warn('Estacion no encontrada: repito el barrido al reves')
+            self.go_path(self.explore_path[-2::-1] + [self.explore_path[-1]])
         self.save_map()
         if self.station is None:
             self.get_logger().error('No se ha encontrado la estacion')
@@ -596,7 +733,6 @@ class autonavigation(Node):
 
         self.phase = 'III'
         if self.dock():
-            self.phase = 'FIN'
             self.get_logger().info('Mision completada')
        
 
@@ -608,15 +744,16 @@ class autonavigation(Node):
 
 def main(args=None):
     print('Hi from autonavigation_11j.')
-    rclpy.init(args=args)
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     node = autonavigation()
     try:
         node.run()
     except KeyboardInterrupt:
         pass
     finally:
-        if rclpy.ok():
-            node.publisher.publish(TwistStamped())
+        for _ in range(5):
+            node.publish_velocity(0.0, 0.0, force=True)
+            time.sleep(0.05)
         if not node.map_saved and node.x is not None and node.pose_source == "slam":
             try:
                 node.save_map()

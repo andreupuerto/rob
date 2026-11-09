@@ -3,7 +3,7 @@
 <package format="3">
   <name>autonavigation_11j</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>Navegacion autonoma de un TurtleBot3 en tres fases con Bug2, SLAM y acoplamiento</description>
   <maintainer email="rob@todo.todo">rob</maintainer>
   <license>TODO: License declaration</license>
 
@@ -12,7 +12,7 @@
   <depend>sensor_msgs</depend>
   <depend>nav_msgs</depend>
   <depend>tf2_ros</depend>
-  <exec_depend>nav2_map_server</exec_depend>
+  <exec_depend>slam_toolbox</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

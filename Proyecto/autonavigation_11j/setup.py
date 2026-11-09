@@ -15,7 +15,7 @@ setup(
     zip_safe=True,
     maintainer='rob',
     maintainer_email='rob@todo.todo',
-    description='TODO: Package description',
+    description='Navegacion autonoma de un TurtleBot3 en tres fases con Bug2, SLAM y acoplamiento',
     license='TODO: License declaration',
     extras_require={
         'test': [
