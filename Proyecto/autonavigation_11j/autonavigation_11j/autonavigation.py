@@ -60,7 +60,21 @@ class autonavigation(Node):
         self.door_yaw = self.get_parameter("door_yaw").value
         self.door_length = self.get_parameter("door_length").value
 
+        self.declare_parameter("pose_source", "slam")
+        self.declare_parameter("explore_path", ["R", "S", "T", "P_Base"])
+        self.declare_parameter("log_file", "mission_log.csv")
+        self.declare_parameter("map_file", "mapa_robot")
+        self.declare_parameter("min_sightings", 15)
+        self.declare_parameter("pillar_max_range", 2.5)
+        self.pose_source = self.get_parameter("pose_source").value
+        self.explore_path = list(self.get_parameter("explore_path").value)
+        self.map_file = self.get_parameter("map_file").value
+        self.min_sightings = self.get_parameter("min_sightings").value
+        self.pillar_max_range = self.get_parameter("pillar_max_range").value
+
         self.max_linear_speed = 0.2
+        self.min_linear_speed = 0.08
+        self.k_linear = 0.5
         self.wall_follow_speed = 0.1
         self.max_angular_speed = 0.8
 
@@ -76,6 +90,17 @@ class autonavigation(Node):
         self.wait_time = 3.0
         self.turn_tolerance = 0.08
         self.door_speed = 0.1
+        self.explore_speed = 0.15
+
+        self.pillar_gap = 0.1
+        self.pillar_max_width = 0.12
+        self.pillar_radius = 0.025
+        self.merge_radius = 0.15
+
+        self.stage_distance = 0.8
+        self.dock_speed = 0.05
+        self.dock_tolerance = 0.03
+        self.dock_emergency = 0.09
 
         self.odom_x = None
         self.odom_y = None
@@ -106,6 +131,23 @@ class autonavigation(Node):
         self.left_hit = False
         self.unreachable = False
         self.wait_since = None
+
+        self.phase = 'I'
+        self.pillars = []
+        self.scan_id = 0
+        self.last_scan_id = 0
+        self.landmarks = []
+        self.station = None
+        self.station_pillars = []
+        self.map_saved = False
+
+        self.log_file = open(self.get_parameter("log_file").value, 'w', newline='')
+        self.log_writer = csv.writer(self.log_file)
+        self.log_writer.writerow(['timestamp', 'current_phase', 'robot_x', 'robot_y',
+                                  'robot_yaw', 'obstacle_front_m', 'pillars_detected',
+                                  'station_x', 'station_y'])
+        self.last_log = 0.0
+        self.log_period = 0.5
 
 
     def odom_callback(self, msg):
@@ -148,31 +190,134 @@ class autonavigation(Node):
         self.closest = closest
         self.goal_free = goal_free
 
+        if self.phase == 'II':
+            self.pillars = self.detect_pillars(msg)
+        else:
+            self.pillars = []
+        self.scan_id += 1
+
     def detect_pillars(self, msg):
-        pass
+        ranges = msg.ranges
+        n = len(ranges)
+        groups = []
+        current = []
+        for i in range(n):
+            r = ranges[i]
+            valid = math.isfinite(r) and msg.range_min < r < self.pillar_max_range
+            if valid and current and abs(r - ranges[current[-1]]) < self.pillar_gap:
+                current.append(i)
+            else:
+                if current:
+                    groups.append(current)
+                current = [i] if valid else []
+        if current:
+            groups.append(current)
+        if len(groups) > 1 and groups[0][0] == 0 and groups[-1][-1] == n - 1 \
+                and abs(ranges[n - 1] - ranges[0]) < self.pillar_gap:
+            groups[0] = groups[-1] + groups[0]
+            groups.pop()
+
+        pillars = []
+        for g in groups:
+            r_mean = sum(ranges[i] for i in g) / len(g)
+            width = r_mean * len(g) * msg.angle_increment
+            if width > self.pillar_max_width:
+                continue
+            sin_sum = 0.0
+            cos_sum = 0.0
+            for i in g:
+                a = msg.angle_min + i * msg.angle_increment
+                sin_sum += math.sin(a)
+                cos_sum += math.cos(a)
+            theta = math.atan2(sin_sum, cos_sum)
+            r = r_mean + self.pillar_radius
+            pillars.append((r * math.cos(theta), r * math.sin(theta)))
+        return pillars
 
     def update_landmarks(self):
-        pass
+        if self.scan_id == self.last_scan_id:
+            return
+        self.last_scan_id = self.scan_id
+        for px, py in self.pillars:
+            wx = self.x + px * math.cos(self.yaw) - py * math.sin(self.yaw)
+            wy = self.y + px * math.sin(self.yaw) + py * math.cos(self.yaw)
+            for lm in self.landmarks:
+                if math.hypot(lm[0] - wx, lm[1] - wy) < self.merge_radius:
+                    lm[0] = (lm[0] * lm[2] + wx) / (lm[2] + 1)
+                    lm[1] = (lm[1] * lm[2] + wy) / (lm[2] + 1)
+                    lm[2] += 1
+                    break
+            else:
+                self.landmarks.append([wx, wy, 1])
+        self.find_station()
+
+    def find_station(self):
+        if self.station is not None:
+            return
+        good = [lm for lm in self.landmarks if lm[2] >= self.min_sightings]
+        for seed in good:
+            near = sorted(good, key=lambda lm: math.hypot(lm[0] - seed[0], lm[1] - seed[1]))[:4]
+            if len(near) < 4:
+                continue
+            dists = [math.hypot(a[0] - b[0], a[1] - b[1])
+                     for i, a in enumerate(near) for b in near[i + 1:]]
+            if max(dists) < 0.7 and min(dists) > 0.25:
+                cx = sum(lm[0] for lm in near) / 4
+                cy = sum(lm[1] for lm in near) / 4
+                self.station = (cx, cy)
+                self.station_pillars = [(lm[0], lm[1]) for lm in near]
+                self.get_logger().info(f'Estacion encontrada: centro=({cx:.2f}, {cy:.2f})')
+                return
 
     def log_row(self):
-        pass
+        now = self.get_clock().now().nanoseconds / 1e9
+        if now - self.last_log < self.log_period:
+            return
+        self.last_log = now
+        obstacle = f'{self.front:.2f}' if self.front is not None and self.front < 3.0 else ''
+        pillars = ';'.join(f'{p[0]:.2f}:{p[1]:.2f}' for p in self.station_pillars)
+        station_x = ''
+        station_y = ''
+        if self.station is not None:
+            station_x = f'{self.station[0]:.3f}'
+            station_y = f'{self.station[1]:.3f}'
+        self.log_writer.writerow([f'{now:.2f}', self.phase, f'{self.x:.3f}', f'{self.y:.3f}',
+                                  f'{self.yaw:.3f}', obstacle, pillars, station_x, station_y])
+        self.log_file.flush()
 
     def slam_pose(self):
-        pass
+        try:
+            t = self.tf_buffer.lookup_transform('map', 'base_footprint', Time())
+        except tf2_ros.TransformException:
+            return None
+        q = t.transform.rotation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                         1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        return t.transform.translation.x, t.transform.translation.y, yaw
 
     def update_pose(self):
-        if self.odom_x is None:
+        if self.pose_source == "slam":
+            raw = self.slam_pose()
+        elif self.odom_x is not None:
+            raw = (self.odom_x, self.odom_y, self.odom_yaw)
+        else:
+            raw = None
+        if raw is None:
             return False
+        x, y, yaw = raw
         if self.x0 is None:
-            self.x0 = self.odom_x
-            self.y0 = self.odom_y
-            self.yaw0 = self.odom_yaw
+            self.x0 = x
+            self.y0 = y
+            self.yaw0 = yaw
         a = self.initial_yaw - self.yaw0
-        dx = self.odom_x - self.x0
-        dy = self.odom_y - self.y0
+        dx = x - self.x0
+        dy = y - self.y0
         self.x = self.initial_x + dx * math.cos(a) - dy * math.sin(a)
         self.y = self.initial_y + dx * math.sin(a) + dy * math.cos(a)
-        self.yaw = normalize_angle(self.odom_yaw - self.yaw0 + self.initial_yaw)
+        self.yaw = normalize_angle(yaw - self.yaw0 + self.initial_yaw)
+        if self.phase == 'II':
+            self.update_landmarks()
+        self.log_row()
         return True
 
     def publish_velocity(self, linear, angular):
@@ -222,7 +367,9 @@ class autonavigation(Node):
             self.stop()
         else:
             self.wait_since = None
-            self.publish_velocity(self.max_linear_speed, angular)
+            linear = max(self.min_linear_speed,
+                         min(self.max_linear_speed, self.k_linear * self.goal_distance))
+            self.publish_velocity(linear, angular)
 
 
     def follow_wall(self):
@@ -341,41 +488,121 @@ class autonavigation(Node):
             self.update_pose()
 
 
-    def look_around(self, seconds):
-        pass
-
-
     def save_map(self):
-        pass
-
-
-    def square_from_pair(self, points, min_side=0.28, max_side=0.50):
-        pass
+        self.get_logger().info(f'Guardando el mapa en {self.map_file}.yaml / .pgm')
+        for attempt in range(2):
+            try:
+                result = subprocess.run(
+                    ['ros2', 'run', 'nav2_map_server', 'map_saver_cli', '-f', self.map_file],
+                    capture_output=True, text=True, timeout=30)
+                if result.returncode == 0:
+                    self.map_saved = True
+                    self.get_logger().info('Mapa guardado')
+                    return
+                self.get_logger().warn(f'map_saver_cli ha fallado: {result.stderr[-300:]}')
+            except (subprocess.TimeoutExpired, OSError) as error:
+                self.get_logger().warn(f'map_saver_cli ha fallado: {error}')
+        self.get_logger().error('No se ha podido guardar el mapa')
 
 
     def dock(self):
-        pass
+        cx, cy = self.station
+        p0 = self.station_pillars[0]
+        others = sorted(self.station_pillars[1:],
+                        key=lambda p: math.hypot(p[0] - p0[0], p[1] - p0[1]))
+        p1 = others[0]
+        side_angle = math.atan2(p1[1] - p0[1], p1[0] - p0[0])
+
+        to_robot = math.atan2(self.y - cy, self.x - cx)
+        normal = side_angle
+        best_diff = 10.0
+        for k in range(4):
+            candidate = normalize_angle(side_angle + k * math.pi / 2)
+            diff = abs(normalize_angle(to_robot - candidate))
+            if diff < best_diff:
+                best_diff = diff
+                normal = candidate
+
+        self.points["Stage"] = (cx + self.stage_distance * math.cos(normal),
+                                cy + self.stage_distance * math.sin(normal))
+        if not self.go_path(["Stage"]):
+            self.get_logger().warn('No he podido llegar al punto de aproximacion')
+            return False
+        self.turn_to_yaw(normalize_angle(normal + math.pi))
+
+        ux = -math.cos(normal)
+        uy = -math.sin(normal)
+        along = 0.0
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.05)
+            if not self.update_pose():
+                continue
+            along = (cx - self.x) * ux + (cy - self.y) * uy
+            if along < self.dock_tolerance:
+                break
+            if self.closest < self.dock_emergency:
+                self.publish_velocity(0.0, 0.0)
+                self.get_logger().warn(f'Algo a {self.closest:.2f} m: parado',
+                                       throttle_duration_sec=2.0)
+                continue
+            axis_x = cx - ux * along
+            axis_y = cy - uy * along
+            ahead = min(0.15, along)
+            target_x = axis_x + ux * ahead
+            target_y = axis_y + uy * ahead
+            error = normalize_angle(math.atan2(target_y - self.y, target_x - self.x) - self.yaw)
+            angular = 2.0 * error
+            if self.left < 0.3 and self.right < 0.3:
+                angular += 1.0 * (self.left - self.right)
+            angular = max(-0.5, min(0.5, angular))
+            linear = self.dock_speed if abs(error) < 0.3 else 0.0
+            self.publish_velocity(linear, angular)
+        self.stop()
+        self.get_logger().info(f'Acoplado: faltan {max(along, 0.0):.3f} m hasta el centro')
+        return True
 
 
     def run(self):
+        waited = 0
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.1)
             if self.update_pose() and self.front is not None:
                 break
+            waited += 1
+            if waited % 50 == 0:
+                self.get_logger().warn('Sin pose o sin LiDAR todavia: esta el SLAM en marcha? '
+                                       '(o prueba con -p pose_source:=odom)')
         self.get_logger().info(
             f'Salida {self.start_point}: x={self.x:.2f} y={self.y:.2f} '
             f'yaw={math.degrees(self.yaw):.1f} grados')
         self.countdown(self.start_delay)
 
-        if self.go_path(self.path):
-            self.turn_to_yaw(self.final_yaw)
-            self.get_logger().info('Fase I completada')
-        else:
+        if not self.go_path(self.path):
             self.get_logger().warn('Fase I interrumpida')
+            return
+        self.turn_to_yaw(self.final_yaw)
+        self.get_logger().info('Fase I completada')
+
+        self.phase = 'II'
+        self.max_linear_speed = self.explore_speed
+        if not self.go_path(self.explore_path):
+            self.get_logger().warn('Fase II interrumpida')
+            return
+        self.save_map()
+        if self.station is None:
+            self.get_logger().error('No se ha encontrado la estacion')
+            return
+        self.get_logger().info('Fase II completada')
+
+        self.phase = 'III'
+        if self.dock():
+            self.phase = 'FIN'
+            self.get_logger().info('Mision completada')
        
 
     def close_log(self):
-        pass
+        if not self.log_file.closed:
+            self.log_file.close()
     
 
 
@@ -390,6 +617,12 @@ def main(args=None):
     finally:
         if rclpy.ok():
             node.publisher.publish(TwistStamped())
+        if not node.map_saved and node.x is not None and node.pose_source == "slam":
+            try:
+                node.save_map()
+            except Exception as error:
+                print(f'No se ha podido guardar el mapa: {error}')
+        node.close_log()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
